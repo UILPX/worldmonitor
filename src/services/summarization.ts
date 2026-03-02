@@ -31,10 +31,17 @@ export interface SummarizeOptions {
   skipBrowserFallback?: boolean; // true = skip browser T5 fallback
 }
 
+type ApiSummarizationProvider = Extract<SummarizationProvider, 'ollama' | 'openai' | 'groq' | 'openrouter'>;
+
 // ── Sebuf client (replaces direct fetch to /api/{provider}-summarize) ──
 
 const newsClient = new NewsServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
-const summaryBreaker = createCircuitBreaker<SummarizeArticleResponse>({ name: 'News Summarization', cacheTtlMs: 0 });
+const summaryBreakers = {
+  ollama: createCircuitBreaker<SummarizeArticleResponse>({ name: 'News Summarization (Ollama)', cacheTtlMs: 0 }),
+  openai: createCircuitBreaker<SummarizeArticleResponse>({ name: 'News Summarization (OpenAI)', cacheTtlMs: 0 }),
+  groq: createCircuitBreaker<SummarizeArticleResponse>({ name: 'News Summarization (Groq)', cacheTtlMs: 0 }),
+  openrouter: createCircuitBreaker<SummarizeArticleResponse>({ name: 'News Summarization (OpenRouter)', cacheTtlMs: 0 }),
+} as const;
 
 const emptySummaryFallback: SummarizeArticleResponse = { summary: '', provider: '', model: '', cached: false, skipped: false, fallback: true, tokens: 0, reason: '', error: '', errorType: '' };
 
@@ -42,8 +49,13 @@ const emptySummaryFallback: SummarizeArticleResponse = { summary: '', provider: 
 
 interface ApiProviderDef {
   featureId: RuntimeFeatureId;
-  provider: SummarizationProvider;
+  provider: ApiSummarizationProvider;
   label: string;
+}
+
+function isChineseLanguage(lang: string | undefined): boolean {
+  const normalized = (lang || '').toLowerCase();
+  return normalized === 'zh' || normalized.startsWith('zh-');
 }
 
 const API_PROVIDERS: ApiProviderDef[] = [
@@ -66,7 +78,7 @@ async function tryApiProvider(
   if (!isFeatureAvailable(providerDef.featureId)) return null;
   lastAttemptedProvider = providerDef.provider;
   try {
-    const resp: SummarizeArticleResponse = await summaryBreaker.execute(async () => {
+    const resp: SummarizeArticleResponse = await summaryBreakers[providerDef.provider].execute(async () => {
       return newsClient.summarizeArticle({
         provider: providerDef.provider,
         headlines,
@@ -78,7 +90,11 @@ async function tryApiProvider(
     }, emptySummaryFallback);
 
     // Provider skipped (credentials missing) or signaled fallback
-    if (resp.skipped || resp.fallback) return null;
+    if (resp.skipped || resp.fallback) {
+      const reason = resp.reason || resp.error || 'no details';
+      console.warn(`[Summarization] ${providerDef.label} skipped/fallback: ${reason}`);
+      return null;
+    }
 
     const summary = typeof resp.summary === 'string' ? resp.summary.trim() : '';
     if (!summary) return null;
@@ -99,7 +115,7 @@ async function tryApiProvider(
 
 // ── Browser T5 provider (different interface -- no API call) ──
 
-async function tryBrowserT5(headlines: string[], modelId?: string): Promise<SummarizationResult | null> {
+async function tryBrowserT5(headlines: string[], modelId?: string, lang = 'en'): Promise<SummarizationResult | null> {
   try {
     if (!mlWorker.isAvailable) {
       return null;
@@ -107,7 +123,9 @@ async function tryBrowserT5(headlines: string[], modelId?: string): Promise<Summ
     lastAttemptedProvider = 'browser';
 
     const combinedText = headlines.slice(0, 5).map(h => h.slice(0, 80)).join('. ');
-    const prompt = `Summarize the most important headline in 2 concise sentences (under 60 words): ${combinedText}`;
+    const prompt = isChineseLanguage(lang)
+      ? `请从以下标题中提炼最重要的一条新闻，用2句简洁的简体中文总结（不超过60字），只写结论不要解释：${combinedText}`
+      : `Summarize the most important headline in 2 concise sentences (under 60 words): ${combinedText}`;
 
     const [summary] = await mlWorker.summarize([prompt], modelId);
 
@@ -191,10 +209,10 @@ async function generateSummaryInternal(
       // Model already loaded -- use browser T5-small first
       if (!options?.skipBrowserFallback) {
         onProgress?.(1, totalSteps, 'Running local AI model (beta)...');
-        const browserResult = await tryBrowserT5(headlines, 'summarization-beta');
+        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', lang);
         if (browserResult) {
           const groqProvider = API_PROVIDERS.find(p => p.provider === 'groq');
-          if (groqProvider && !options?.skipCloudProviders) tryApiProvider(groqProvider, headlines, geoContext).catch(() => {});
+          if (groqProvider && !options?.skipCloudProviders) tryApiProvider(groqProvider, headlines, geoContext, lang).catch(() => {});
 
           return browserResult;
         }
@@ -202,7 +220,7 @@ async function generateSummaryInternal(
 
       // Warm model failed inference -- fallback through API providers
       if (!options?.skipCloudProviders) {
-        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, undefined, onProgress, 2, totalSteps);
+        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, lang, onProgress, 2, totalSteps);
         if (chainResult) return chainResult;
       }
     } else {
@@ -213,7 +231,7 @@ async function generateSummaryInternal(
 
       // API providers while model loads
       if (!options?.skipCloudProviders) {
-        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, undefined, onProgress, 1, totalSteps);
+        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, lang, onProgress, 1, totalSteps);
         if (chainResult) {
           return chainResult;
         }
@@ -222,7 +240,7 @@ async function generateSummaryInternal(
       // Last resort: try browser T5 (may have finished loading by now)
       if (mlWorker.isAvailable && !options?.skipBrowserFallback) {
         onProgress?.(API_PROVIDERS.length + 1, totalSteps, 'Waiting for local AI model...');
-        const browserResult = await tryBrowserT5(headlines, 'summarization-beta');
+        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', lang);
         if (browserResult) return browserResult;
       }
 
@@ -244,7 +262,7 @@ async function generateSummaryInternal(
 
   if (!options?.skipBrowserFallback) {
     onProgress?.(totalSteps, totalSteps, 'Loading local AI model...');
-    const browserResult = await tryBrowserT5(headlines);
+    const browserResult = await tryBrowserT5(headlines, undefined, lang);
     if (browserResult) return browserResult;
   }
 
@@ -271,7 +289,7 @@ export async function translateText(
 
     onProgress?.(i + 1, totalSteps, `Translating with ${providerDef.label}...`);
     try {
-      const resp = await summaryBreaker.execute(async () => {
+      const resp = await summaryBreakers[providerDef.provider].execute(async () => {
         return newsClient.summarizeArticle({
           provider: providerDef.provider,
           headlines: [text],
@@ -282,7 +300,11 @@ export async function translateText(
         });
       }, emptySummaryFallback);
 
-      if (resp.fallback || resp.skipped) continue;
+      if (resp.fallback || resp.skipped) {
+        const reason = resp.reason || resp.error || 'no details';
+        console.warn(`[Summarization] ${providerDef.label} translation skipped/fallback: ${reason}`);
+        continue;
+      }
       const summary = typeof resp.summary === 'string' ? resp.summary.trim() : '';
       if (summary) return summary;
     } catch (e) {

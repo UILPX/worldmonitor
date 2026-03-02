@@ -620,7 +620,7 @@ export class App {
     this.refreshScheduler.scheduleRefresh(
       'strategic-posture',
       () => (this.state.panels['strategic-posture'] as StrategicPosturePanel).refresh(),
-      15 * 60_000,
+      30 * 60_000,
       () => !!this.state.panels['strategic-posture']
     );
     this.refreshScheduler.scheduleRefresh(

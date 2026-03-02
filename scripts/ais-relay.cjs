@@ -13,7 +13,13 @@ const http = require('http');
 const https = require('https');
 const zlib = require('zlib');
 const path = require('path');
-const { readFileSync } = require('fs');
+const {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+} = require('fs');
 const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
@@ -49,6 +55,12 @@ function safeInt(envVal, fallback, min) {
   const n = Number(envVal);
   return Number.isFinite(n) ? Math.max(min, Math.floor(n)) : fallback;
 }
+function envEnabled(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const normalized = String(raw).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
 const MAX_VESSELS = safeInt(process.env.AIS_MAX_VESSELS, 20000, 1000);
 const MAX_VESSEL_HISTORY = safeInt(process.env.AIS_MAX_VESSEL_HISTORY, 20000, 1000);
 const MAX_DENSITY_CELLS = 5000;
@@ -74,6 +86,24 @@ const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTT
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 const RELAY_VERBOSE_HTTP = process.env.RELAY_VERBOSE_HTTP === 'true'
   || (!IS_PRODUCTION_RELAY && process.env.RELAY_VERBOSE_HTTP !== 'false');
+
+// Local disk cache persistence (best for strict-rate APIs; survives relay restarts)
+const RELAY_DISK_CACHE_ENABLED = envEnabled('RELAY_DISK_CACHE_ENABLED', true);
+const RELAY_DISK_CACHE_DIR = process.env.RELAY_DISK_CACHE_DIR || path.join(process.cwd(), 'tmp', 'relay-cache');
+const RELAY_DISK_CACHE_FLUSH_INTERVAL_MS = safeInt(process.env.RELAY_DISK_CACHE_FLUSH_INTERVAL_MS, 5 * 60 * 1000, 30 * 1000);
+const RELAY_DISK_CACHE_MAX_FILE_BYTES = safeInt(process.env.RELAY_DISK_CACHE_MAX_FILE_BYTES, 12 * 1024 * 1024, 256 * 1024);
+const RELAY_DISK_CACHE_MAX_ENTRY_BYTES = safeInt(process.env.RELAY_DISK_CACHE_MAX_ENTRY_BYTES, 1 * 1024 * 1024, 8 * 1024);
+const RELAY_DISK_CACHE_OPENSKY = envEnabled('RELAY_DISK_CACHE_OPENSKY', true);
+const RELAY_DISK_CACHE_UCDP = envEnabled('RELAY_DISK_CACHE_UCDP', true);
+const RELAY_DISK_CACHE_WORLDBANK = envEnabled('RELAY_DISK_CACHE_WORLDBANK', true);
+const RELAY_DISK_CACHE_POLYMARKET = envEnabled('RELAY_DISK_CACHE_POLYMARKET', true);
+const RELAY_DISK_CACHE_NOTAM = envEnabled('RELAY_DISK_CACHE_NOTAM', true);
+const RELAY_DISK_CACHE_OPENSKY_MAX_ENTRIES = safeInt(process.env.RELAY_DISK_CACHE_OPENSKY_MAX_ENTRIES, 24, 4);
+const RELAY_DISK_CACHE_WORLDBANK_MAX_ENTRIES = safeInt(process.env.RELAY_DISK_CACHE_WORLDBANK_MAX_ENTRIES, 80, 8);
+const RELAY_DISK_CACHE_POLYMARKET_MAX_ENTRIES = safeInt(process.env.RELAY_DISK_CACHE_POLYMARKET_MAX_ENTRIES, 40, 8);
+const RELAY_DISK_CACHE_VERSION = 1;
+let relayDiskCacheDirReady = false;
+let relayDiskCacheFlushTimer = null;
 
 // OREF (Israel Home Front Command) siren alerts — fetched via HTTP proxy (Israel exit)
 const OREF_PROXY_AUTH = process.env.OREF_PROXY_AUTH || ''; // format: user:pass@host:port
@@ -166,6 +196,100 @@ function upstashSet(key, value, ttlSeconds) {
     req.on('timeout', () => { req.destroy(); resolve(false); });
     req.end(body);
   });
+}
+
+function ensureRelayDiskCacheDir() {
+  if (!RELAY_DISK_CACHE_ENABLED) return false;
+  if (relayDiskCacheDirReady) return true;
+  try {
+    mkdirSync(RELAY_DISK_CACHE_DIR, { recursive: true });
+    relayDiskCacheDirReady = true;
+    return true;
+  } catch (err) {
+    console.warn('[Relay] Disk cache disabled (failed to create dir):', err?.message || String(err));
+    return false;
+  }
+}
+
+function relayDiskCachePath(name) {
+  return path.join(RELAY_DISK_CACHE_DIR, `${name}.v${RELAY_DISK_CACHE_VERSION}.json`);
+}
+
+function readRelayDiskCache(name) {
+  if (!RELAY_DISK_CACHE_ENABLED || !ensureRelayDiskCacheDir()) return null;
+  const filePath = relayDiskCachePath(name);
+  if (!existsSync(filePath)) return null;
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (err) {
+    console.warn(`[Relay] Disk cache read failed (${name}):`, err?.message || String(err));
+    return null;
+  }
+}
+
+function writeRelayDiskCache(name, payload) {
+  if (!RELAY_DISK_CACHE_ENABLED || !ensureRelayDiskCacheDir()) return false;
+  try {
+    const wrapper = {
+      version: RELAY_DISK_CACHE_VERSION,
+      savedAt: Date.now(),
+      payload,
+    };
+    const serialized = JSON.stringify(wrapper);
+    if (Buffer.byteLength(serialized) > RELAY_DISK_CACHE_MAX_FILE_BYTES) {
+      console.warn(`[Relay] Disk cache skip (${name}): payload too large`);
+      return false;
+    }
+    const target = relayDiskCachePath(name);
+    const tmp = `${target}.tmp-${process.pid}`;
+    writeFileSync(tmp, serialized, 'utf8');
+    renameSync(tmp, target);
+    return true;
+  } catch (err) {
+    console.warn(`[Relay] Disk cache write failed (${name}):`, err?.message || String(err));
+    return false;
+  }
+}
+
+function encodeMapEntriesForDiskCache(map, {
+  maxEntries = 64,
+  maxAgeMs = Number.POSITIVE_INFINITY,
+  entryEncoder = (entry) => entry,
+} = {}) {
+  const now = Date.now();
+  const out = [];
+  const newestFirst = Array.from(map.entries()).reverse();
+  for (const [key, entry] of newestFirst) {
+    if (!entry || typeof entry !== 'object') continue;
+    const ts = Number(entry.timestamp || entry.ts || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (now - ts > maxAgeMs) continue;
+    const encoded = entryEncoder(entry);
+    if (!encoded) continue;
+    const size = Buffer.byteLength(JSON.stringify(encoded));
+    if (size > RELAY_DISK_CACHE_MAX_ENTRY_BYTES) continue;
+    out.push([key, encoded]);
+    if (out.length >= maxEntries) break;
+  }
+  out.reverse();
+  return out;
+}
+
+function restoreMapEntriesFromDiskCache(map, rows, entryDecoder = (entry) => entry) {
+  if (!Array.isArray(rows)) return 0;
+  let restored = 0;
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length !== 2) continue;
+    const key = String(row[0] ?? '');
+    if (!key) continue;
+    const decoded = entryDecoder(row[1]);
+    if (!decoded || typeof decoded !== 'object') continue;
+    map.set(key, decoded);
+    restored++;
+  }
+  return restored;
 }
 
 let upstreamSocket = null;
@@ -1675,8 +1799,8 @@ async function handleUcdpEventsRequest(req, res) {
 const openskyResponseCache = new Map(); // key: sorted query params → { data, gzip, timestamp }
 const openskyNegativeCache = new Map(); // key: cacheKey → { status, timestamp, body, gzip } — prevents retry storms on 429/5xx
 const openskyInFlight = new Map(); // key: cacheKey → Promise (dedup concurrent requests)
-const OPENSKY_CACHE_TTL_MS = Number(process.env.OPENSKY_CACHE_TTL_MS) || 60 * 1000; // 60s default — env-configurable
-const OPENSKY_NEGATIVE_CACHE_TTL_MS = Number(process.env.OPENSKY_NEGATIVE_CACHE_TTL_MS) || 30 * 1000; // 30s — env-configurable
+const OPENSKY_CACHE_TTL_MS = Number(process.env.OPENSKY_CACHE_TTL_MS) || 15 * 60 * 1000; // 15 min default — conservative for strict quotas
+const OPENSKY_NEGATIVE_CACHE_TTL_MS = Number(process.env.OPENSKY_NEGATIVE_CACHE_TTL_MS) || 10 * 60 * 1000; // 10 min backoff on 429/5xx
 const OPENSKY_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.OPENSKY_CACHE_MAX_ENTRIES || 128));
 const OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES || 256));
 const OPENSKY_BBOX_QUANT_STEP = Number.isFinite(Number(process.env.OPENSKY_BBOX_QUANT_STEP))
@@ -1691,6 +1815,11 @@ const rssInFlight = new Map(); // key: feed URL → Promise (dedup concurrent re
 const RSS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — RSS feeds rarely update faster
 const RSS_NEGATIVE_CACHE_TTL_MS = 60 * 1000; // 1 min — cache failures to prevent thundering herd
 const RSS_CACHE_MAX_ENTRIES = 200; // hard cap — ~20 allowed domains × ~5 paths max, with headroom
+const RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS = safeInt(process.env.RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS, 60 * 60 * 1000, 60 * 1000);
+const RELAY_DISK_CACHE_UCDP_MAX_AGE_MS = safeInt(process.env.RELAY_DISK_CACHE_UCDP_MAX_AGE_MS, 48 * 60 * 60 * 1000, 60 * 60 * 1000);
+const RELAY_DISK_CACHE_WORLDBANK_MAX_AGE_MS = safeInt(process.env.RELAY_DISK_CACHE_WORLDBANK_MAX_AGE_MS, 24 * 60 * 60 * 1000, 5 * 60 * 1000);
+const RELAY_DISK_CACHE_POLYMARKET_MAX_AGE_MS = safeInt(process.env.RELAY_DISK_CACHE_POLYMARKET_MAX_AGE_MS, 6 * 60 * 60 * 1000, 5 * 60 * 1000);
+const RELAY_DISK_CACHE_NOTAM_MAX_AGE_MS = safeInt(process.env.RELAY_DISK_CACHE_NOTAM_MAX_AGE_MS, 24 * 60 * 60 * 1000, 5 * 60 * 1000);
 
 function setBoundedCacheEntry(cache, key, value, maxEntries) {
   if (!cache.has(key) && cache.size >= maxEntries) {
@@ -1776,8 +1905,8 @@ const OPENSKY_AUTH_COOLDOWN_MS = 60000; // 1 min cooldown after auth failure
 
 // Global OpenSky rate limiter — serializes upstream requests and enforces 429 cooldown
 let openskyGlobal429Until = 0; // timestamp: block ALL upstream requests until this time
-const OPENSKY_429_COOLDOWN_MS = Number(process.env.OPENSKY_429_COOLDOWN_MS) || 90 * 1000; // 90s cooldown after any 429
-const OPENSKY_REQUEST_SPACING_MS = Number(process.env.OPENSKY_REQUEST_SPACING_MS) || 2000; // 2s minimum between consecutive upstream requests
+const OPENSKY_429_COOLDOWN_MS = Number(process.env.OPENSKY_429_COOLDOWN_MS) || 10 * 60 * 1000; // 10 min cooldown after any 429
+const OPENSKY_REQUEST_SPACING_MS = Number(process.env.OPENSKY_REQUEST_SPACING_MS) || 12 * 1000; // 12s minimum between consecutive upstream requests
 let openskyLastUpstreamTime = 0;
 let openskyUpstreamQueue = Promise.resolve(); // serial chain — only 1 upstream request at a time
 
@@ -1951,15 +2080,15 @@ async function handleOpenSkyRequest(req, res, PORT) {
     cacheKey = normalizedBbox.cacheKey;
     incrementRelayMetric('openskyRequests');
 
-    // 1. Check positive cache (30s TTL)
+    // 1. Check positive cache (TTL is OPENSKY_CACHE_TTL_MS)
     const cached = openskyResponseCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < OPENSKY_CACHE_TTL_MS) {
       incrementRelayMetric('openskyCacheHit');
       touchCacheEntry(openskyResponseCache, cacheKey, cached); // LRU
       return sendPreGzipped(req, res, 200, {
         'Content-Type': 'application/json',
-        'Cache-Control': 'public, max-age=30',
-        'CDN-Cache-Control': 'public, max-age=15',
+        'Cache-Control': 'public, max-age=120',
+        'CDN-Cache-Control': 'public, max-age=60',
         'X-Cache': 'HIT',
       }, cached.data, cached.gzip);
     }
@@ -2003,8 +2132,8 @@ async function handleOpenSkyRequest(req, res, PORT) {
         touchCacheEntry(openskyResponseCache, cacheKey, deduped); // LRU
         return sendPreGzipped(req, res, 200, {
           'Content-Type': 'application/json',
-          'Cache-Control': 'public, max-age=30',
-          'CDN-Cache-Control': 'public, max-age=15',
+          'Cache-Control': 'public, max-age=120',
+          'CDN-Cache-Control': 'public, max-age=60',
           'X-Cache': 'DEDUP',
         }, deduped.data, deduped.gzip);
       }
@@ -2097,8 +2226,8 @@ async function handleOpenSkyRequest(req, res, PORT) {
     const responseData = result.data || JSON.stringify({ error: result.error?.message || 'upstream error', time: Date.now(), states: null });
     return sendCompressed(req, res, upstreamStatus, {
       'Content-Type': 'application/json',
-      'Cache-Control': upstreamStatus === 200 ? 'public, max-age=30' : 'no-cache',
-      'CDN-Cache-Control': upstreamStatus === 200 ? 'public, max-age=15' : 'no-store',
+      'Cache-Control': upstreamStatus === 200 ? 'public, max-age=120' : 'no-cache',
+      'CDN-Cache-Control': upstreamStatus === 200 ? 'public, max-age=60' : 'no-store',
       'X-Cache': result.rateLimited ? 'RATE-LIMITED' : 'MISS',
     }, responseData);
   } catch (err) {
@@ -2822,6 +2951,195 @@ function handleNotamProxyRequest(req, res) {
   });
 }
 
+function restoreRelayDiskCaches() {
+  if (!RELAY_DISK_CACHE_ENABLED || !ensureRelayDiskCacheDir()) return;
+
+  const now = Date.now();
+  const restored = {
+    opensky: 0,
+    openskyNeg: 0,
+    ucdp: false,
+    worldbank: 0,
+    polymarket: 0,
+    notam: false,
+  };
+
+  if (RELAY_DISK_CACHE_OPENSKY) {
+    const opensky = readRelayDiskCache('opensky');
+    const payload = opensky?.payload || {};
+    restored.opensky = restoreMapEntriesFromDiskCache(openskyResponseCache, payload.positive, (row) => {
+      if (!row || typeof row !== 'object') return null;
+      const ts = Number(row.timestamp || 0);
+      if (!Number.isFinite(ts) || ts <= 0 || now - ts > RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS) return null;
+      if (typeof row.data !== 'string') return null;
+      return {
+        data: row.data,
+        gzip: gzipSyncBuffer(row.data),
+        timestamp: ts,
+      };
+    });
+    restored.openskyNeg = restoreMapEntriesFromDiskCache(openskyNegativeCache, payload.negative, (row) => {
+      if (!row || typeof row !== 'object') return null;
+      const ts = Number(row.timestamp || 0);
+      if (!Number.isFinite(ts) || ts <= 0 || now - ts > RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS) return null;
+      const status = Number(row.status || 429);
+      const body = typeof row.body === 'string' ? row.body : JSON.stringify({ states: [], time: ts });
+      return {
+        status,
+        timestamp: ts,
+        body,
+        gzip: gzipSyncBuffer(body),
+      };
+    });
+  }
+
+  if (RELAY_DISK_CACHE_UCDP) {
+    const ucdp = readRelayDiskCache('ucdp');
+    const payload = ucdp?.payload;
+    if (payload && typeof payload === 'object') {
+      const ts = Number(payload.timestamp || 0);
+      if (Number.isFinite(ts) && ts > 0 && now - ts <= RELAY_DISK_CACHE_UCDP_MAX_AGE_MS && payload.data) {
+        ucdpCache = { data: payload.data, timestamp: ts };
+        restored.ucdp = true;
+      }
+    }
+  }
+
+  if (RELAY_DISK_CACHE_WORLDBANK) {
+    const worldbank = readRelayDiskCache('worldbank');
+    restored.worldbank = restoreMapEntriesFromDiskCache(worldbankCache, worldbank?.payload?.entries, (row) => {
+      if (!row || typeof row !== 'object') return null;
+      const ts = Number(row.timestamp || 0);
+      if (!Number.isFinite(ts) || ts <= 0 || now - ts > RELAY_DISK_CACHE_WORLDBANK_MAX_AGE_MS) return null;
+      if (typeof row.data !== 'string') return null;
+      return { data: row.data, timestamp: ts };
+    });
+  }
+
+  if (RELAY_DISK_CACHE_POLYMARKET) {
+    const polymarket = readRelayDiskCache('polymarket');
+    restored.polymarket = restoreMapEntriesFromDiskCache(polymarketCache, polymarket?.payload?.entries, (row) => {
+      if (!row || typeof row !== 'object') return null;
+      const ts = Number(row.timestamp || 0);
+      if (!Number.isFinite(ts) || ts <= 0 || now - ts > RELAY_DISK_CACHE_POLYMARKET_MAX_AGE_MS) return null;
+      if (typeof row.data !== 'string') return null;
+      return { data: row.data, timestamp: ts };
+    });
+  }
+
+  if (RELAY_DISK_CACHE_NOTAM) {
+    const notam = readRelayDiskCache('notam');
+    const payload = notam?.payload;
+    if (payload && typeof payload === 'object') {
+      const ts = Number(payload.ts || payload.timestamp || 0);
+      if (
+        Number.isFinite(ts)
+        && ts > 0
+        && now - ts <= RELAY_DISK_CACHE_NOTAM_MAX_AGE_MS
+        && typeof payload.data === 'string'
+        && typeof payload.key === 'string'
+      ) {
+        notamCache.data = payload.data;
+        notamCache.key = payload.key;
+        notamCache.ts = ts;
+        restored.notam = true;
+      }
+    }
+  }
+
+  console.log(
+    `[Relay] Disk cache restored: opensky=${restored.opensky} opensky_neg=${restored.openskyNeg} `
+    + `ucdp=${restored.ucdp ? 'warm' : 'cold'} worldbank=${restored.worldbank} `
+    + `polymarket=${restored.polymarket} notam=${restored.notam ? 'warm' : 'cold'}`
+  );
+}
+
+function persistRelayDiskCaches({ reason = 'periodic', log = false } = {}) {
+  if (!RELAY_DISK_CACHE_ENABLED || !ensureRelayDiskCacheDir()) return;
+
+  if (RELAY_DISK_CACHE_OPENSKY) {
+    const positive = encodeMapEntriesForDiskCache(openskyResponseCache, {
+      maxEntries: RELAY_DISK_CACHE_OPENSKY_MAX_ENTRIES,
+      maxAgeMs: RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS,
+      entryEncoder: (entry) => {
+        if (typeof entry.data !== 'string') return null;
+        return { data: entry.data, timestamp: Number(entry.timestamp || 0) };
+      },
+    });
+    const negative = encodeMapEntriesForDiskCache(openskyNegativeCache, {
+      maxEntries: RELAY_DISK_CACHE_OPENSKY_MAX_ENTRIES,
+      maxAgeMs: RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS,
+      entryEncoder: (entry) => {
+        if (typeof entry.body !== 'string') return null;
+        return {
+          status: Number(entry.status || 429),
+          timestamp: Number(entry.timestamp || 0),
+          body: entry.body,
+        };
+      },
+    });
+    writeRelayDiskCache('opensky', { positive, negative, reason });
+  }
+
+  if (RELAY_DISK_CACHE_UCDP) {
+    const payload = (ucdpCache?.data && Number.isFinite(Number(ucdpCache.timestamp || 0)))
+      ? { data: ucdpCache.data, timestamp: Number(ucdpCache.timestamp || 0), reason }
+      : { data: null, timestamp: 0, reason };
+    writeRelayDiskCache('ucdp', payload);
+  }
+
+  if (RELAY_DISK_CACHE_WORLDBANK) {
+    const entries = encodeMapEntriesForDiskCache(worldbankCache, {
+      maxEntries: RELAY_DISK_CACHE_WORLDBANK_MAX_ENTRIES,
+      maxAgeMs: RELAY_DISK_CACHE_WORLDBANK_MAX_AGE_MS,
+      entryEncoder: (entry) => {
+        if (typeof entry.data !== 'string') return null;
+        return { data: entry.data, timestamp: Number(entry.timestamp || 0) };
+      },
+    });
+    writeRelayDiskCache('worldbank', { entries, reason });
+  }
+
+  if (RELAY_DISK_CACHE_POLYMARKET) {
+    const entries = encodeMapEntriesForDiskCache(polymarketCache, {
+      maxEntries: RELAY_DISK_CACHE_POLYMARKET_MAX_ENTRIES,
+      maxAgeMs: RELAY_DISK_CACHE_POLYMARKET_MAX_AGE_MS,
+      entryEncoder: (entry) => {
+        if (typeof entry.data !== 'string') return null;
+        return { data: entry.data, timestamp: Number(entry.timestamp || 0) };
+      },
+    });
+    writeRelayDiskCache('polymarket', { entries, reason });
+  }
+
+  if (RELAY_DISK_CACHE_NOTAM) {
+    const payload = (typeof notamCache.data === 'string' && typeof notamCache.key === 'string')
+      ? { key: notamCache.key, data: notamCache.data, ts: Number(notamCache.ts || 0), reason }
+      : { key: '', data: null, ts: 0, reason };
+    writeRelayDiskCache('notam', payload);
+  }
+
+  if (log) {
+    console.log('[Relay] Disk cache persisted:', reason);
+  }
+}
+
+function startRelayDiskCacheLoop() {
+  if (!RELAY_DISK_CACHE_ENABLED) {
+    console.log('[Relay] Disk cache: disabled');
+    return;
+  }
+  if (!ensureRelayDiskCacheDir()) return;
+  restoreRelayDiskCaches();
+  relayDiskCacheFlushTimer = setInterval(() => {
+    persistRelayDiskCaches({ reason: 'periodic', log: false });
+  }, RELAY_DISK_CACHE_FLUSH_INTERVAL_MS);
+  relayDiskCacheFlushTimer.unref?.();
+  console.log(`[Relay] Disk cache: enabled dir=${RELAY_DISK_CACHE_DIR} flush=${Math.round(RELAY_DISK_CACHE_FLUSH_INTERVAL_MS / 1000)}s`);
+}
+
+startRelayDiskCacheLoop();
+
 // CORS origin allowlist — only our domains can use this relay
 const ALLOWED_ORIGINS = [
   'https://worldmonitor.app',
@@ -3524,6 +3842,13 @@ setInterval(() => {
 // the Telegram session alive while the new container connects → AUTH_KEY_DUPLICATED.
 async function gracefulShutdown(signal) {
   console.log(`[Relay] ${signal} received — shutting down`);
+  if (relayDiskCacheFlushTimer) {
+    clearInterval(relayDiskCacheFlushTimer);
+    relayDiskCacheFlushTimer = null;
+  }
+  try {
+    persistRelayDiskCaches({ reason: `shutdown:${signal}`, log: true });
+  } catch {}
   if (telegramState.client) {
     console.log('[Relay] Disconnecting Telegram client...');
     try {

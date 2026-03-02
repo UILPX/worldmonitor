@@ -4,8 +4,9 @@ import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 import { validateApiKey } from './_api-key.js';
 // @ts-expect-error — JS module, no declaration file
 import { checkRateLimit } from './_rate-limit.js';
-import { cachedFetchJson } from '../server/_shared/redis';
+import { cachedFetchJson, setCachedJson } from '../server/_shared/redis';
 import { CHROME_UA } from '../server/_shared/constants';
+import { logLocalLlmRequest } from '../server/_shared/local-llm-log';
 
 export const config = { runtime: 'edge' };
 
@@ -46,12 +47,57 @@ interface ProviderConfig {
 }
 
 const VALID_VARIANTS = new Set<Variant>(['full', 'tech', 'finance', 'happy']);
+const TIMELINE_BRIEF_CACHE_VERSION = 'v2';
 const SLOT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60;
 const NEGATIVE_TTL_SECONDS = 120;
 const TEN_MIN_MS = 10 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const HALF_DAY_MS = 12 * HOUR_MS;
 const NY_TZ = 'America/New_York';
+
+function parsePositiveInt(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function getProviderTimeoutMs(provider: ProviderConfig['id']): number {
+  if (provider === 'ollama') {
+    return parsePositiveInt(process.env.TIMELINE_OLLAMA_TIMEOUT_MS)
+      ?? parsePositiveInt(process.env.OLLAMA_TIMEOUT_MS)
+      ?? 15_000;
+  }
+  return parsePositiveInt(process.env.TIMELINE_LLM_UPSTREAM_TIMEOUT_MS)
+    ?? parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS)
+    ?? 12_000;
+}
+
+function getTimelineTotalTimeoutMs(): number {
+  return parsePositiveInt(process.env.TIMELINE_LLM_TOTAL_TIMEOUT_MS) ?? 22_000;
+}
+
+function usesMaxCompletionTokens(provider: ProviderConfig['id'], model: string): boolean {
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
+
+function usesDefaultSamplingOnly(provider: ProviderConfig['id'], model: string): boolean {
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
 
 function normalizeVariant(value: string | null): Variant {
   if (value && VALID_VARIANTS.has(value as Variant)) return value as Variant;
@@ -270,7 +316,9 @@ Rules:
 - Synthesize ONLY from the provided headlines.
 - No speculation, no hype, no bullet points.
 - Mention 2-3 most important developments only.
-- Use plain neutral language.`;
+- Use plain neutral language.
+- Output MUST be in Simplified Chinese (简体中文, zh-CN).
+- Never use Traditional Chinese characters.`;
   const user = `Window UTC: ${startIso} to ${endIso}
 
 Headlines:
@@ -278,6 +326,18 @@ ${lines}
 
 Return one short paragraph.`;
   return { system, user };
+}
+
+function isLikelyChinese(text: string): boolean {
+  if (!text) return false;
+  const cjk = text.match(/[\u4e00-\u9fff]/g)?.length ?? 0;
+  return cjk >= 12;
+}
+
+function getPeriodLabelZh(period: BriefPeriod): string {
+  if (period === '10m') return '10分钟';
+  if (period === '1h') return '1小时';
+  return '12小时';
 }
 
 async function summarizeHeadlines(
@@ -291,25 +351,36 @@ async function summarizeHeadlines(
     throw new Error('No AI provider configured');
   }
   const prompts = buildPrompts(headlines, period, startMs, endMs);
+  const deadline = Date.now() + getTimelineTotalTimeoutMs();
 
   let lastError = 'Unknown AI error';
   for (const provider of providers) {
     try {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 800) {
+        lastError = 'timeline llm budget exceeded';
+        break;
+      }
+      const completionLimit = 180;
+      const body = {
+        model: provider.model,
+        messages: [
+          { role: 'system', content: prompts.system },
+          { role: 'user', content: prompts.user },
+        ],
+        ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
+        ...(usesMaxCompletionTokens(provider.id, provider.model)
+          ? { max_completion_tokens: completionLimit }
+          : { max_tokens: completionLimit }),
+        ...(provider.extraBody || {}),
+      };
+
+      logLocalLlmRequest('timeline-briefs', provider.id, provider.apiUrl, provider.model);
       const resp = await fetch(provider.apiUrl, {
         method: 'POST',
         headers: { ...provider.headers, 'User-Agent': CHROME_UA },
-        body: JSON.stringify({
-          model: provider.model,
-          messages: [
-            { role: 'system', content: prompts.system },
-            { role: 'user', content: prompts.user },
-          ],
-          temperature: 0.2,
-          max_tokens: 180,
-          top_p: 0.9,
-          ...(provider.extraBody || {}),
-        }),
-        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Math.min(getProviderTimeoutMs(provider.id), remainingMs)),
       });
 
       if (!resp.ok) {
@@ -321,6 +392,10 @@ async function summarizeHeadlines(
       const content = String(data?.choices?.[0]?.message?.content || '').trim();
       if (!content || content.length < 20) {
         lastError = `${provider.id} empty response`;
+        continue;
+      }
+      if (!isLikelyChinese(content)) {
+        lastError = `${provider.id} non-Chinese response`;
         continue;
       }
       return {
@@ -343,57 +418,65 @@ async function buildBriefForSlot(
   startMs: number,
   endMs: number,
   slotKey: string,
+  forceRefresh = false,
 ): Promise<TimelineBrief> {
-  const cacheKey = `timeline:briefs:v1:${variant}:${period}:${slotKey}`;
+  const cacheKey = `timeline:briefs:${TIMELINE_BRIEF_CACHE_VERSION}:${variant}:${period}:${slotKey}`;
+
+  const generateBrief = async (): Promise<TimelineBrief> => {
+    const digest = await digestPromise;
+    const headlines = collectHeadlines(digest, startMs, endMs);
+    if (headlines.length === 0) {
+      return {
+        period,
+        slotKey,
+        startMs,
+        endMs,
+        generatedAt: Date.now(),
+        summary: '该时间窗口内暂无重大进展。',
+        headlineCount: 0,
+        provider: 'none',
+        model: '',
+      };
+    }
+
+    try {
+      const summarized = await summarizeHeadlines(headlines, period, startMs, endMs);
+      return {
+        period,
+        slotKey,
+        startMs,
+        endMs,
+        generatedAt: Date.now(),
+        summary: summarized.summary,
+        headlineCount: headlines.length,
+        provider: summarized.provider,
+        model: summarized.model,
+      };
+    } catch {
+      return {
+        period,
+        slotKey,
+        startMs,
+        endMs,
+        generatedAt: Date.now(),
+        summary: `该${getPeriodLabelZh(period)}窗口摘要暂不可用，请稍后重试。`,
+        headlineCount: headlines.length,
+        provider: 'fallback',
+        model: '',
+      };
+    }
+  };
+
+  if (forceRefresh) {
+    const forced = await generateBrief();
+    await setCachedJson(cacheKey, forced, SLOT_CACHE_TTL_SECONDS);
+    return forced;
+  }
 
   const payload = await cachedFetchJson<TimelineBrief>(
     cacheKey,
     SLOT_CACHE_TTL_SECONDS,
-    async () => {
-      const digest = await digestPromise;
-      const headlines = collectHeadlines(digest, startMs, endMs);
-      if (headlines.length === 0) {
-        return {
-          period,
-          slotKey,
-          startMs,
-          endMs,
-          generatedAt: Date.now(),
-          summary: 'No major developments in this window.',
-          headlineCount: 0,
-          provider: 'none',
-          model: '',
-        };
-      }
-
-      try {
-        const summarized = await summarizeHeadlines(headlines, period, startMs, endMs);
-        return {
-          period,
-          slotKey,
-          startMs,
-          endMs,
-          generatedAt: Date.now(),
-          summary: summarized.summary,
-          headlineCount: headlines.length,
-          provider: summarized.provider,
-          model: summarized.model,
-        };
-      } catch (error) {
-        const topHeadlines = headlines.slice(0, 3).join(' | ');
-        return {
-          period,
-          slotKey,
-          startMs,
-          endMs,
-          generatedAt: Date.now(),
-          summary: topHeadlines || 'Summary unavailable for this window.',
-          headlineCount: headlines.length,
-          provider: 'fallback',
-          model: '',
-        };
-      }
-    },
+    generateBrief,
     NEGATIVE_TTL_SECONDS,
   );
 
@@ -405,7 +488,7 @@ async function buildBriefForSlot(
     startMs,
     endMs,
     generatedAt: Date.now(),
-    summary: 'Summary unavailable for this window.',
+    summary: '该时间窗口摘要暂不可用。',
     headlineCount: 0,
     provider: 'none',
     model: '',
@@ -447,6 +530,8 @@ export default async function handler(req: Request): Promise<Response> {
   try {
     const requestUrl = new URL(req.url);
     const variant = normalizeVariant(requestUrl.searchParams.get('variant'));
+    const forceTenMinutes = requestUrl.searchParams.get('forceTenMinutes') === '1';
+    const onlyTenMinutes = requestUrl.searchParams.get('only') === '10m';
     const origin = requestUrl.origin;
     const nowMs = Date.now();
 
@@ -455,11 +540,22 @@ export default async function handler(req: Request): Promise<Response> {
     const nyHalfDaySlot = getNyHalfDaySlot(nowMs);
 
     const digestPromise = fetchDigest(origin, variant);
-    const [brief10m, brief1h, brief12h] = await Promise.all([
-      buildBriefForSlot(digestPromise, variant, '10m', tenSlot.startMs, tenSlot.endMs, tenSlot.slotKey),
-      buildBriefForSlot(digestPromise, variant, '1h', hourSlot.startMs, hourSlot.endMs, hourSlot.slotKey),
-      buildBriefForSlot(digestPromise, variant, '12h', nyHalfDaySlot.startMs, nyHalfDaySlot.endMs, nyHalfDaySlot.slotKey),
-    ]);
+    const brief10m = await buildBriefForSlot(
+      digestPromise,
+      variant,
+      '10m',
+      tenSlot.startMs,
+      tenSlot.endMs,
+      tenSlot.slotKey,
+      forceTenMinutes,
+    );
+
+    const [brief1h, brief12h] = onlyTenMinutes
+      ? [undefined, undefined]
+      : await Promise.all([
+        buildBriefForSlot(digestPromise, variant, '1h', hourSlot.startMs, hourSlot.endMs, hourSlot.slotKey),
+        buildBriefForSlot(digestPromise, variant, '12h', nyHalfDaySlot.startMs, nyHalfDaySlot.endMs, nyHalfDaySlot.slotKey),
+      ]);
 
     return new Response(JSON.stringify({
       generatedAt: Date.now(),
@@ -478,11 +574,14 @@ export default async function handler(req: Request): Promise<Response> {
       status: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Cache-Control': 'public, max-age=30, s-maxage=60, stale-while-revalidate=120',
+        'Cache-Control': forceTenMinutes
+          ? 'no-store'
+          : 'public, max-age=30, s-maxage=60, stale-while-revalidate=120',
         ...corsHeaders,
       },
     });
   } catch (error) {
+    console.error('[timeline-briefs] request failed:', error);
     return new Response(JSON.stringify({
       error: 'Timeline summary failed',
       details: error instanceof Error ? error.message : String(error),

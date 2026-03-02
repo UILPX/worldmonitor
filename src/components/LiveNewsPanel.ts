@@ -276,8 +276,8 @@ export class LiveNewsPanel extends Panel {
   private liveBtn: HTMLButtonElement | null = null;
   private idleTimeout: ReturnType<typeof setTimeout> | null = null;
   private readonly IDLE_PAUSE_MS = 5 * 60 * 1000; // 5 minutes
-  private boundVisibilityHandler!: () => void;
-  private boundIdleResetHandler!: () => void;
+  private boundVisibilityHandler: () => void = () => {};
+  private boundIdleResetHandler: () => void = () => {};
 
   // YouTube Player API state
   private player: YouTubePlayer | null = null;
@@ -295,7 +295,7 @@ export class LiveNewsPanel extends Panel {
   private desktopEmbedIframe: HTMLIFrameElement | null = null;
   private desktopEmbedRenderToken = 0;
   private suppressChannelClick = false;
-  private boundMessageHandler!: (e: MessageEvent) => void;
+  private boundMessageHandler: (e: MessageEvent) => void = () => {};
   private muteSyncInterval: ReturnType<typeof setInterval> | null = null;
   private static readonly MUTE_SYNC_POLL_MS = 500;
 
@@ -308,10 +308,9 @@ export class LiveNewsPanel extends Panel {
   private nativeVideoElement: HTMLVideoElement | null = null;
   private hlsFailureCooldown = new Map<string, number>();
   private readonly HLS_COOLDOWN_MS = 5 * 60 * 1000;
+  private isActivated = false;
 
   private deferredInit = false;
-  private lazyObserver: IntersectionObserver | null = null;
-  private idleCallbackId: number | ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     super({ id: 'live-news', title: t('panels.liveNews'), className: 'panel-wide' });
@@ -323,10 +322,7 @@ export class LiveNewsPanel extends Panel {
     this.createLiveButton();
     this.createMuteButton();
     this.createChannelSwitcher();
-    this.setupBridgeMessageListener();
     this.renderPlaceholder();
-    this.setupLazyInit();
-    this.setupIdleDetection();
     document.addEventListener('keydown', this.boundFullscreenEscHandler);
   }
 
@@ -338,11 +334,11 @@ export class LiveNewsPanel extends Panel {
 
     const label = document.createElement('div');
     label.style.cssText = 'color:var(--text-secondary);font-size:13px;';
-    label.textContent = this.activeChannel.name;
+    label.textContent = t('components.liveNews.liveStreamLabel') || 'Live News Stream';
 
     const playBtn = document.createElement('button');
     playBtn.className = 'offline-retry';
-    playBtn.textContent = 'Load Player';
+    playBtn.textContent = t('components.liveNews.loadPlayer') || 'Load Player';
     playBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       this.triggerInit();
@@ -354,36 +350,14 @@ export class LiveNewsPanel extends Panel {
     this.content.appendChild(container);
   }
 
-  private setupLazyInit(): void {
-    this.lazyObserver = new IntersectionObserver(
-      (entries) => {
-        if (entries.some(e => e.isIntersecting)) {
-          this.lazyObserver?.disconnect();
-          this.lazyObserver = null;
-          if ('requestIdleCallback' in window) {
-            this.idleCallbackId = (window as any).requestIdleCallback(
-              () => { this.idleCallbackId = null; this.triggerInit(); },
-              { timeout: 1000 },
-            );
-          } else {
-            this.idleCallbackId = setTimeout(() => { this.idleCallbackId = null; this.triggerInit(); }, 1000);
-          }
-        }
-      },
-      { threshold: 0.1 },
-    );
-    this.lazyObserver.observe(this.element);
-  }
-
   private triggerInit(): void {
     if (this.deferredInit) return;
-    this.deferredInit = true;
-    if (this.lazyObserver) { this.lazyObserver.disconnect(); this.lazyObserver = null; }
-    if (this.idleCallbackId !== null) {
-      if ('cancelIdleCallback' in window) (window as any).cancelIdleCallback(this.idleCallbackId);
-      else clearTimeout(this.idleCallbackId as ReturnType<typeof setTimeout>);
-      this.idleCallbackId = null;
+    if (!this.isActivated) {
+      this.isActivated = true;
+      this.setupBridgeMessageListener();
+      this.setupIdleDetection();
     }
+    this.deferredInit = true;
     this.renderPlayer();
   }
 
@@ -597,6 +571,10 @@ export class LiveNewsPanel extends Panel {
   }
 
   private togglePlayback(): void {
+    if (!this.isActivated) {
+      this.triggerInit();
+      return;
+    }
     this.isPlaying = !this.isPlaying;
     this.wasPlayingBeforeIdle = this.isPlaying;
     this.updateLiveIndicator();
@@ -852,6 +830,17 @@ export class LiveNewsPanel extends Panel {
     this.channelSwitcher?.querySelectorAll('.live-channel-btn').forEach(btn => {
       const btnEl = btn as HTMLElement;
       btnEl.classList.toggle('active', btnEl.dataset.channelId === channel.id);
+      btnEl.classList.remove('loading');
+      btnEl.classList.remove('offline');
+    });
+
+    if (!this.isActivated) {
+      this.renderPlaceholder();
+      return;
+    }
+
+    this.channelSwitcher?.querySelectorAll('.live-channel-btn').forEach(btn => {
+      const btnEl = btn as HTMLElement;
       if (btnEl.dataset.channelId === channel.id) {
         btnEl.classList.add('loading');
       }
@@ -1399,6 +1388,7 @@ export class LiveNewsPanel extends Panel {
   }
 
   public refresh(): void {
+    if (!this.isActivated) return;
     this.syncPlayerState();
   }
 
@@ -1407,21 +1397,21 @@ export class LiveNewsPanel extends Panel {
     this.channels = loadChannelsFromStorage();
     if (this.channels.length === 0) this.channels = getDefaultLiveChannels();
     if (!this.channels.some((c) => c.id === this.activeChannel.id)) {
-      this.activeChannel = this.channels[0]!;
-      void this.switchChannel(this.activeChannel);
+      const nextChannel = this.channels[0]!;
+      if (this.isActivated) {
+        void this.switchChannel(nextChannel);
+      } else {
+        this.activeChannel = nextChannel;
+      }
     }
     this.refreshChannelSwitcher();
+    if (!this.isActivated) {
+      this.renderPlaceholder();
+    }
   }
 
   public destroy(): void {
     this.destroyPlayer();
-
-    if (this.lazyObserver) { this.lazyObserver.disconnect(); this.lazyObserver = null; }
-    if (this.idleCallbackId !== null) {
-      if ('cancelIdleCallback' in window) (window as any).cancelIdleCallback(this.idleCallbackId);
-      else clearTimeout(this.idleCallbackId as ReturnType<typeof setTimeout>);
-      this.idleCallbackId = null;
-    }
 
     if (this.idleTimeout) {
       clearTimeout(this.idleTimeout);

@@ -1,5 +1,5 @@
 import type { AppContext, AppModule } from '@/app/app-context';
-import type { NewsItem, MapLayers, SocialUnrestEvent } from '@/types';
+import type { ClusteredEvent, NewsItem, MapLayers, SocialUnrestEvent } from '@/types';
 import type { MarketData } from '@/types';
 import type { TimeRange } from '@/components';
 import {
@@ -66,7 +66,7 @@ import {
 } from '@/services';
 import { checkBatchForBreakingAlerts, dispatchOrefBreakingAlert } from '@/services/breaking-news-alerts';
 import { mlWorker } from '@/services/ml-worker';
-import { clusterNewsHybrid } from '@/services/clustering';
+import { clusterNews, clusterNewsHybrid } from '@/services/clustering';
 import { ingestProtests, ingestFlights, ingestVessels, ingestEarthquakes, detectGeoConvergence, geoConvergenceToSignal } from '@/services/geo-convergence';
 import { signalAggregator } from '@/services/signal-aggregator';
 import { updateAndCheck } from '@/services/temporal-baseline';
@@ -245,7 +245,13 @@ export class DataLoaderManager implements AppModule {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json() as ListFeedDigestResponse;
       const catCount = Object.keys(data.categories ?? {}).length;
+      const totalItems = Object.values(data.categories ?? {}).reduce((sum, category) => {
+        return sum + (category?.items?.length ?? 0);
+      }, 0);
       console.info(`[News] Digest fetched: ${catCount} categories`);
+      // Digest success indicates the live-news source is reachable,
+      // even when zero items are returned in this window.
+      dataFreshness.recordUpdate('rss', totalItems);
       this.lastGoodDigest = data;
       this.persistDigest(data);
       this.digestBreaker = { state: 'closed', failures: 0, cooldownUntil: 0 };
@@ -557,6 +563,36 @@ export class DataLoaderManager implements AppModule {
       this.ctx.map.flashLocation(location.lat, location.lon);
       this.mapFlashCache.set(cacheKey, now);
     }
+  }
+
+  private clusterNewsWithFallback(items: NewsItem[]): ClusteredEvent[] {
+    if (items.length === 0) return [];
+
+    try {
+      const clustered = clusterNews(items);
+      if (clustered.length > 0) return clustered;
+    } catch (error) {
+      console.warn('[App] Local clustering fallback failed:', error);
+    }
+
+    // Last-resort fallback: treat each recent headline as a single-item cluster.
+    return items.slice(0, 80).map((item, index) => ({
+      id: `fallback-${item.pubDate.getTime()}-${index}`,
+      primaryTitle: item.title,
+      primarySource: item.source,
+      primaryLink: item.link,
+      sourceCount: 1,
+      topSources: [{ name: item.source, tier: item.tier ?? 3, url: item.link }],
+      allItems: [item],
+      firstSeen: item.pubDate,
+      lastUpdated: item.pubDate,
+      isAlert: Boolean(item.isAlert),
+      ...(item.monitorColor ? { monitorColor: item.monitorColor } : {}),
+      ...(item.threat ? { threat: item.threat } : {}),
+      ...(item.lat != null ? { lat: item.lat } : {}),
+      ...(item.lon != null ? { lon: item.lon } : {}),
+      ...(item.lang ? { lang: item.lang } : {}),
+    }));
   }
 
   getTimeRangeWindowMs(range: TimeRange): number {
@@ -903,6 +939,7 @@ export class DataLoaderManager implements AppModule {
           } catch (e) { console.warn('[Baseline] news:intel write failed:', e); }
         }
         this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: intel.length });
+        dataFreshness.recordUpdate('gdelt', intel.length);
         collectedNews.push(...intel);
         this.flashMapForNews(intel);
       } else {
@@ -944,6 +981,7 @@ export class DataLoaderManager implements AppModule {
               } catch (e) { console.warn('[Baseline] news:intel write failed:', e); }
             }
             this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: intel.length });
+            dataFreshness.recordUpdate('gdelt', intel.length);
             collectedNews.push(...intel);
             this.flashMapForNews(intel);
           } else {
@@ -993,8 +1031,12 @@ export class DataLoaderManager implements AppModule {
       }
     } catch (error) {
       console.error('[App] Clustering failed, clusters unchanged:', error);
+      const fallbackClusters = this.ctx.latestClusters.length > 0
+        ? this.ctx.latestClusters
+        : this.clusterNewsWithFallback(this.ctx.allNews);
+      this.ctx.latestClusters = fallbackClusters;
       const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
-      insightsPanel?.updateInsights([]);
+      insightsPanel?.updateInsights(fallbackClusters);
     }
 
     // Happy variant: run multi-stage positive news pipeline + map layers
@@ -1251,8 +1293,8 @@ export class DataLoaderManager implements AppModule {
         signalAggregator.ingestProtests(protestData.events);
         const protestCount = protestData.sources.acled + protestData.sources.gdelt;
         if (protestCount > 0) dataFreshness.recordUpdate('acled', protestCount);
-        if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
-        if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+        dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+        dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
         if (this.ctx.mapLayers.protests) {
           this.ctx.map?.setProtests(protestData.events);
           this.ctx.map?.setLayerReady('protests', protestData.events.length > 0);
@@ -1707,7 +1749,8 @@ export class DataLoaderManager implements AppModule {
         this.ctx.statusPanel?.updateApi('ACLED', { status: 'warning' });
       }
       this.ctx.statusPanel?.updateApi('GDELT Doc', { status: 'ok' });
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
       return;
     }
     try {
@@ -1720,8 +1763,8 @@ export class DataLoaderManager implements AppModule {
       signalAggregator.ingestProtests(protestData.events);
       const protestCount = protestData.sources.acled + protestData.sources.gdelt;
       if (protestCount > 0) dataFreshness.recordUpdate('acled', protestCount);
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
       (this.ctx.panels['cii'] as CIIPanel)?.refresh();
       const status = getProtestStatus();
       this.ctx.statusPanel?.updateFeed('Protests', {

@@ -60,10 +60,12 @@ export class LiveWebcamsPanel extends Panel {
   private toolbar: HTMLElement | null = null;
   private iframes: HTMLIFrameElement[] = [];
   private observer: IntersectionObserver | null = null;
+  private isActivated = false;
   private isVisible = false;
   private idleTimeout: ReturnType<typeof setTimeout> | null = null;
-  private boundIdleResetHandler!: () => void;
-  private boundVisibilityHandler!: () => void;
+  private boundIdleResetHandler: () => void = () => {};
+  private boundVisibilityHandler: () => void = () => {};
+  private renderTimers: ReturnType<typeof setTimeout>[] = [];
   private readonly IDLE_PAUSE_MS = 5 * 60 * 1000;
   private isIdle = false;
   private fullscreenBtn: HTMLButtonElement | null = null;
@@ -73,8 +75,6 @@ export class LiveWebcamsPanel extends Panel {
     super({ id: 'live-webcams', title: t('panels.liveWebcams'), className: 'panel-wide' });
     this.createFullscreenButton();
     this.createToolbar();
-    this.setupIntersectionObserver();
-    this.setupIdleDetection();
     subscribeStreamQualityChange(() => this.render());
     this.render();
     document.addEventListener('keydown', this.boundFullscreenEscHandler);
@@ -218,19 +218,60 @@ export class LiveWebcamsPanel extends Panel {
     iframe.title = `${feed.city} live webcam`;
     iframe.allow = 'autoplay; encrypted-media; picture-in-picture';
     iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+    iframe.setAttribute('loading', 'lazy');
     if (!isDesktopRuntime()) {
       iframe.allowFullscreen = true;
-      iframe.setAttribute('loading', 'lazy');
       iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation');
     }
     return iframe;
   }
 
+  private activate(): void {
+    if (this.isActivated) return;
+    this.isActivated = true;
+    this.isVisible = true;
+    this.setupIntersectionObserver();
+    this.setupIdleDetection();
+    this.render();
+  }
+
+  private renderLoadPrompt(): void {
+    this.content.className = 'panel-content webcam-content';
+    this.content.innerHTML = '';
+
+    const container = document.createElement('div');
+    container.className = 'webcam-placeholder';
+    container.style.flexDirection = 'column';
+    container.style.gap = '10px';
+    container.style.cursor = 'pointer';
+
+    const hint = document.createElement('div');
+    hint.textContent = t('components.webcams.clickToLoad') || 'Click to load webcams';
+
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'offline-retry';
+    loadBtn.textContent = t('components.webcams.load') || 'Load Webcams';
+    loadBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.activate();
+    });
+
+    container.addEventListener('click', () => this.activate());
+    container.append(hint, loadBtn);
+    this.content.appendChild(container);
+  }
+
   private render(): void {
+    this.clearRenderTimers();
     this.destroyIframes();
 
+    if (!this.isActivated) {
+      this.renderLoadPrompt();
+      return;
+    }
+
     if (!this.isVisible || this.isIdle) {
-      this.content.innerHTML = '<div class="webcam-placeholder">Webcams paused</div>';
+      this.content.innerHTML = `<div class="webcam-placeholder">${t('components.webcams.paused') || 'Webcams paused'}</div>`;
       return;
     }
 
@@ -286,12 +327,13 @@ export class LiveWebcamsPanel extends Panel {
 
       if (desktop && i > 0) {
         // Stagger iframe creation on desktop — WKWebView throttles concurrent autoplay.
-        setTimeout(() => {
+        const timer = setTimeout(() => {
           if (!this.isVisible || this.isIdle) return;
           const iframe = this.createIframe(feed);
           cell.insertBefore(iframe, label);
           this.iframes.push(iframe);
         }, i * 800);
+        this.renderTimers.push(timer);
       } else {
         const iframe = this.createIframe(feed);
         cell.insertBefore(iframe, label);
@@ -346,6 +388,11 @@ export class LiveWebcamsPanel extends Panel {
     this.iframes = [];
   }
 
+  private clearRenderTimers(): void {
+    this.renderTimers.forEach((timer) => clearTimeout(timer));
+    this.renderTimers = [];
+  }
+
   private setupIntersectionObserver(): void {
     this.observer = new IntersectionObserver(
       (entries) => {
@@ -384,8 +431,9 @@ export class LiveWebcamsPanel extends Panel {
       }
       this.idleTimeout = setTimeout(() => {
         this.isIdle = true;
+        this.clearRenderTimers();
         this.destroyIframes();
-        this.content.innerHTML = '<div class="webcam-placeholder">Webcams paused — move mouse to resume</div>';
+        this.content.innerHTML = `<div class="webcam-placeholder">${t('components.webcams.pausedIdle') || 'Webcams paused - move mouse to resume'}</div>`;
       }, this.IDLE_PAUSE_MS);
     };
 
@@ -397,12 +445,14 @@ export class LiveWebcamsPanel extends Panel {
   }
 
   public refresh(): void {
+    if (!this.isActivated) return;
     if (this.isVisible && !this.isIdle) {
       this.render();
     }
   }
 
   public destroy(): void {
+    this.clearRenderTimers();
     if (this.idleTimeout) {
       clearTimeout(this.idleTimeout);
       this.idleTimeout = null;

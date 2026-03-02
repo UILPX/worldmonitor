@@ -54,6 +54,7 @@ export class RecentEventsQAPanel extends Panel {
   }
 
   private render(): void {
+    let askBtn: HTMLButtonElement | null = null;
     const textarea = document.createElement('textarea');
     textarea.className = 'recent-events-qa-input';
     textarea.placeholder = t('components.recentEventsQa.placeholder');
@@ -63,6 +64,9 @@ export class RecentEventsQAPanel extends Panel {
     textarea.disabled = this.isLoading;
     textarea.addEventListener('input', () => {
       this.question = textarea.value;
+      if (askBtn) {
+        askBtn.disabled = this.isLoading || this.question.trim().length < 3;
+      }
     });
     textarea.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
@@ -71,23 +75,15 @@ export class RecentEventsQAPanel extends Panel {
       }
     });
 
-    const askBtn = h('button', {
+    askBtn = h('button', {
       type: 'button',
       className: 'recent-events-qa-submit',
       disabled: this.isLoading || this.question.trim().length < 3,
       onClick: () => void this.submitQuestion(),
-    }, this.isLoading ? t('components.recentEventsQa.asking') : t('components.recentEventsQa.ask'));
+    }, this.isLoading ? t('components.recentEventsQa.asking') : t('components.recentEventsQa.ask')) as HTMLButtonElement;
 
     const controls = h('div', { className: 'recent-events-qa-controls' }, textarea, askBtn);
-    const hints = h(
-      'div',
-      { className: 'recent-events-qa-hints' },
-      t('components.recentEventsQa.hintCache'),
-      ' · ',
-      t('components.recentEventsQa.hintRateLimit'),
-    );
-
-    const body: HTMLElement[] = [controls, hints];
+    const body: HTMLElement[] = [controls];
 
     if (this.errorMessage) {
       body.push(h('div', { className: 'recent-events-qa-error' }, this.errorMessage));
@@ -103,14 +99,6 @@ export class RecentEventsQAPanel extends Panel {
             `${t('components.recentEventsQa.updated')}: ${this.formatLocal(this.answer.generatedAt)}`,
             ' · ',
             `${t('components.recentEventsQa.window')}: ${this.formatLocal(this.answer.windowStartMs)} → ${this.formatLocal(this.answer.windowEndMs)}`,
-          ),
-          h(
-            'div',
-            { className: 'recent-events-qa-meta' },
-            `${t('components.recentEventsQa.headlines')}: ${this.answer.headlineCount}`,
-            ' · ',
-            `${t('components.recentEventsQa.contextChars')}: ${this.answer.contextChars}`,
-            this.answer.provider ? ` · ${t('components.recentEventsQa.provider')}: ${this.answer.provider}${this.answer.model ? `/${this.answer.model}` : ''}` : '',
           ),
         ),
       );
@@ -161,8 +149,7 @@ export class RecentEventsQAPanel extends Panel {
       const data = await resp.json() as RecentEventsQAResponse;
       this.answer = data;
       this.errorMessage = '';
-      const detail = data.provider ? `${data.provider}${data.model ? `/${data.model}` : ''}` : undefined;
-      this.setDataBadge(data.cached ? 'cached' : 'live', detail);
+      this.setDataBadge(data.cached ? 'cached' : 'live');
     } catch {
       this.errorMessage = t('components.recentEventsQa.failed');
       this.setDataBadge('unavailable');

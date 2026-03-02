@@ -1093,6 +1093,11 @@ body.panel-resize-active iframe {
   color: var(--text);
 }
 
+.panel[data-panel="regional-news"] .panel-title {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .panel-count {
   font-size: 10px;
   color: var(--text-dim);
@@ -1377,10 +1382,6 @@ body.panel-resize-active iframe {
   display: inline-flex;
 }
 
-.panel.panel-tooltip-open .panel-info-wrapper {
-  z-index: 1202;
-}
-
 .panel-info-btn {
   width: 14px;
   height: 14px;
@@ -1405,10 +1406,10 @@ body.panel-resize-active iframe {
 }
 
 .panel-info-tooltip {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 50%;
-  transform: translateX(-50%);
+  position: fixed;
+  top: 0;
+  left: 0;
+  transform: none;
   background: var(--border-subtle);
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -1417,28 +1418,26 @@ body.panel-resize-active iframe {
   line-height: 1.5;
   color: var(--text);
   min-width: 220px;
-  max-width: 300px;
-  z-index: 1000;
+  max-width: min(320px, calc(100vw - 16px));
+  z-index: 10020;
   box-shadow: 0 4px 16px var(--shadow-color);
   opacity: 0;
   visibility: hidden;
+  pointer-events: none;
   transition: opacity 0.15s ease, visibility 0.15s ease;
-}
-
-.panel.panel-tooltip-open .panel-info-tooltip {
-  z-index: 1203;
 }
 
 .panel-info-tooltip.visible {
   opacity: 1;
   visibility: visible;
+  pointer-events: auto;
 }
 
 .panel-info-tooltip::before {
   content: '';
   position: absolute;
   top: -6px;
-  left: 50%;
+  left: var(--panel-tooltip-arrow-x, 50%);
   transform: translateX(-50%);
   border: 6px solid transparent;
   border-bottom-color: var(--border-strong);
@@ -1448,10 +1447,24 @@ body.panel-resize-active iframe {
   content: '';
   position: absolute;
   top: -4px;
-  left: 50%;
+  left: var(--panel-tooltip-arrow-x, 50%);
   transform: translateX(-50%);
   border: 5px solid transparent;
   border-bottom-color: var(--border-subtle);
+}
+
+.panel-info-tooltip.tooltip-above::before {
+  top: auto;
+  bottom: -6px;
+  border-bottom-color: transparent;
+  border-top-color: var(--border-strong);
+}
+
+.panel-info-tooltip.tooltip-above::after {
+  top: auto;
+  bottom: -4px;
+  border-bottom-color: transparent;
+  border-top-color: var(--border-subtle);
 }
 
 .panel-info-tooltip strong {
@@ -3577,7 +3590,7 @@ body.playback-mode .status-dot {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
-  z-index: 200;
+  z-index: 1200;
   overflow: hidden;
   box-shadow: 0 8px 32px var(--shadow-color);
 }

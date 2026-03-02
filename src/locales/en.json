@@ -516,6 +516,8 @@
       "everyTenMinutes": "Every 10 minutes",
       "everyHour": "Top of each hour",
       "nyTwiceDaily": "08:00 / 20:00 New York",
+      "refreshTenMinutes": "Refresh 10-minute brief now (test)",
+      "refreshTenMinutesShort": "10m↻",
       "window": "Window",
       "updated": "Updated",
       "headlines": "Headlines",
@@ -541,6 +543,10 @@
       "infoTooltip": "Ask questions about recent events. Answers are generated from cached recent headlines only. Context size and request rate are constrained for stability."
     },
     "webcams": {
+      "load": "Load Webcams",
+      "clickToLoad": "Click to load webcams",
+      "paused": "Webcams paused",
+      "pausedIdle": "Webcams paused - move mouse to resume",
       "regions": {
         "iran": "IRAN ATTACKS",
         "all": "ALL",
@@ -1462,6 +1468,8 @@
     },
     "liveNews": {
       "retry": "Retry",
+      "loadPlayer": "Load Player",
+      "liveStreamLabel": "Live News Stream",
       "notLive": "{{name}} is not currently live",
       "cannotEmbed": "{{name}} cannot be embedded in this app (YouTube {{code}})",
       "botCheck": "YouTube is requesting sign-in to play {{name}}",

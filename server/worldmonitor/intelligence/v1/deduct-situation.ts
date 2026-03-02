@@ -9,11 +9,30 @@ import type {
 import { cachedFetchJson } from '../../../_shared/redis';
 import { hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
+import { logLocalLlmRequest } from '../../../_shared/local-llm-log';
 
 const DEDUCT_TIMEOUT_MS = 120_000;
 const DEDUCT_CACHE_TTL = 3600;
 const DEFAULT_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const DEFAULT_MODEL = 'llama-3.1-8b-instant';
+
+function parsePositiveInt(raw: string | undefined): number | null {
+    if (!raw) return null;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    return Math.floor(value);
+}
+
+function usesOpenAiCompletionTokens(apiUrl: string, model: string): boolean {
+    if (!/api\.openai\.com/i.test(apiUrl)) return false;
+    const normalized = model.toLowerCase();
+    return (
+        normalized.startsWith('gpt-5')
+        || normalized.startsWith('o1')
+        || normalized.startsWith('o3')
+        || normalized.startsWith('o4')
+    );
+}
 
 export async function deductSituation(
     _ctx: ServerContext,
@@ -55,6 +74,20 @@ Your task is to DEDUCT the situation in a near timeline (e.g. 24 hours to a few 
                     userPrompt += `\n\n### Current Intelligence Context\n${geoContext}`;
                 }
 
+                const completionLimit = 1500;
+                const payload = {
+                    model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt },
+                    ],
+                    temperature: 0.3,
+                    ...(usesOpenAiCompletionTokens(apiUrl, model)
+                        ? { max_completion_tokens: completionLimit }
+                        : { max_tokens: completionLimit }),
+                };
+
+                logLocalLlmRequest('deduct-situation', 'llm', apiUrl, model);
                 const resp = await fetch(apiUrl, {
                     method: 'POST',
                     headers: {
@@ -62,16 +95,8 @@ Your task is to DEDUCT the situation in a near timeline (e.g. 24 hours to a few 
                         'Content-Type': 'application/json',
                         'User-Agent': CHROME_UA
                     },
-                    body: JSON.stringify({
-                        model,
-                        messages: [
-                            { role: 'system', content: systemPrompt },
-                            { role: 'user', content: userPrompt },
-                        ],
-                        temperature: 0.3,
-                        max_tokens: 1500,
-                    }),
-                    signal: AbortSignal.timeout(DEDUCT_TIMEOUT_MS),
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? DEDUCT_TIMEOUT_MS),
                 });
 
                 if (!resp.ok) return null;

@@ -13,6 +13,7 @@ import {
   getCacheKey,
 } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
+import { logLocalLlmRequest } from '../../../_shared/local-llm-log';
 
 // ======================================================================
 // Reasoning preamble detection
@@ -24,6 +25,50 @@ export const PROMPT_ECHO = /^(summarize the top story|summarize the key|rules:|h
 export function hasReasoningPreamble(text: string): boolean {
   const trimmed = text.trim();
   return TASK_NARRATION.test(trimmed) || PROMPT_ECHO.test(trimmed);
+}
+
+function usesMaxCompletionTokens(provider: string, model: string): boolean {
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
+
+function usesDefaultSamplingOnly(provider: string, model: string): boolean {
+  // OpenAI reasoning/newer models may only support default sampling params.
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
+
+function buildTokenLimit(provider: string, model: string, maxTokens: number): Record<string, number> {
+  if (usesMaxCompletionTokens(provider, model)) {
+    return { max_completion_tokens: maxTokens };
+  }
+  return { max_tokens: maxTokens };
+}
+
+function parsePositiveInt(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function getProviderTimeoutMs(provider: string): number {
+  if (provider === 'ollama') {
+    return parsePositiveInt(process.env.OLLAMA_TIMEOUT_MS) ?? 120_000;
+  }
+  return parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? 30_000;
 }
 
 // ======================================================================
@@ -105,27 +150,70 @@ export async function summarizeArticle(
           lang,
         });
 
-        const response = await fetch(apiUrl, {
+        const completionLimit = 100;
+        const buildBasePayload = (includeSampling: boolean) => ({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          ...(includeSampling ? { temperature: 0.3, top_p: 0.9 } : {}),
+          ...extraBody,
+        });
+        const basePayload = buildBasePayload(!usesDefaultSamplingOnly(provider, model));
+        const initialPayload = {
+          ...basePayload,
+          ...buildTokenLimit(provider, model, completionLimit),
+        };
+
+        logLocalLlmRequest('summarize-article', provider, apiUrl, model);
+        let response = await fetch(apiUrl, {
           method: 'POST',
           headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            temperature: 0.3,
-            max_tokens: 100,
-            top_p: 0.9,
-            ...extraBody,
-          }),
-          signal: AbortSignal.timeout(30_000),
+          body: JSON.stringify(initialPayload),
+          signal: AbortSignal.timeout(getProviderTimeoutMs(provider)),
         });
 
         if (!response.ok) {
-          const errorText = await response.text();
-          console.error(`[SummarizeArticle:${provider}] API error:`, response.status, errorText);
-          throw new Error(response.status === 429 ? 'Rate limited' : `${provider} API error`);
+          let errorText = await response.text();
+
+          // OpenAI compatibility fallback for models that require max_completion_tokens.
+          const shouldRetryWithCompletionTokens = (
+            provider === 'openai'
+            && response.status === 400
+            && /max_tokens/i.test(errorText)
+            && /max_completion_tokens/i.test(errorText)
+          );
+          const shouldRetryWithoutSampling = (
+            provider === 'openai'
+            && response.status === 400
+            && /temperature/i.test(errorText)
+            && /default/i.test(errorText)
+          );
+
+          if (shouldRetryWithCompletionTokens || shouldRetryWithoutSampling) {
+            const retryPayload = buildBasePayload(false);
+            logLocalLlmRequest('summarize-article-retry', provider, apiUrl, model);
+            response = await fetch(apiUrl, {
+              method: 'POST',
+              headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
+              body: JSON.stringify({
+                ...retryPayload,
+                ...buildTokenLimit(provider, model, completionLimit),
+              }),
+              signal: AbortSignal.timeout(getProviderTimeoutMs(provider)),
+            });
+            if (response.ok) {
+              errorText = '';
+            } else {
+              errorText = await response.text();
+            }
+          }
+
+          if (!response.ok) {
+            console.error(`[SummarizeArticle:${provider}] API error:`, response.status, errorText);
+            throw new Error(response.status === 429 ? 'Rate limited' : `${provider} API error`);
+          }
         }
 
         const data = await response.json() as any;

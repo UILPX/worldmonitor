@@ -293,10 +293,10 @@ export class PanelLayoutManager implements AppModule {
     return inferRegionalNewsFeedFromView(this.ctx.resolvedLocation);
   }
 
-  private setRegionalNewsPanelTitle(panel: NewsPanel, category: RegionalNewsFeedKey): void {
+  private setRegionalNewsPanelTitle(panel: NewsPanel, _category: RegionalNewsFeedKey): void {
     const titleEl = panel.getElement().querySelector('.panel-title');
     if (!titleEl) return;
-    titleEl.textContent = `${t('panels.regionalNews')} · ${this.getRegionalNewsLabel(category)}`;
+    titleEl.textContent = t('panels.regionalNews');
   }
 
   private renderSelectedRegionalNews(panel: NewsPanel): void {

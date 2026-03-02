@@ -6,6 +6,7 @@ import { validateApiKey } from './_api-key.js';
 import { checkRateLimit } from './_rate-limit.js';
 import { cachedFetchJson, cachedFetchJsonWithMeta } from '../server/_shared/redis';
 import { CHROME_UA } from '../server/_shared/constants';
+import { logLocalLlmRequest } from '../server/_shared/local-llm-log';
 
 export const config = { runtime: 'edge' };
 
@@ -87,6 +88,35 @@ const GLOBAL_LIMIT = readPositiveInt('RECENT_QA_GLOBAL_LIMIT', 180);
 const GLOBAL_WINDOW_SECONDS = readPositiveInt('RECENT_QA_GLOBAL_WINDOW_SECONDS', 600);
 const VISITOR_LIMIT = readPositiveInt('RECENT_QA_VISITOR_LIMIT', 8);
 const VISITOR_WINDOW_SECONDS = readPositiveInt('RECENT_QA_VISITOR_WINDOW_SECONDS', 600);
+
+function getProviderTimeoutMs(provider: ProviderConfig['id']): number {
+  if (provider === 'ollama') {
+    return readPositiveInt('OLLAMA_TIMEOUT_MS', 120_000);
+  }
+  return readPositiveInt('LLM_UPSTREAM_TIMEOUT_MS', 30_000);
+}
+
+function usesMaxCompletionTokens(provider: ProviderConfig['id'], model: string): boolean {
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
+
+function usesDefaultSamplingOnly(provider: ProviderConfig['id'], model: string): boolean {
+  if (provider !== 'openai') return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith('gpt-5')
+    || normalized.startsWith('o1')
+    || normalized.startsWith('o3')
+    || normalized.startsWith('o4')
+  );
+}
 
 function normalizeVariant(value: string | null): Variant {
   if (value && VALID_VARIANTS.has(value as Variant)) return value as Variant;
@@ -306,14 +336,15 @@ Rules:
 - Do not invent facts.
 - If evidence is insufficient, explicitly say so.
 - Keep answer under 120 words.
-- Use plain text only (no markdown table, no code block).`;
+- Use plain text only (no markdown table, no code block).
+- Always answer in Simplified Chinese (简体中文, zh-CN).
+- Never use Traditional Chinese characters.`;
   const user = `Question:
 ${question}
 
 Recent headlines:
 ${context.lines.join('\n')}
-
-Answer in the same language as the question.`;
+`;
   return { system, user };
 }
 
@@ -331,21 +362,26 @@ async function askWithProviders(
 
   for (const provider of providers) {
     try {
+      const completionLimit = 260;
+      const body = {
+        model: provider.model,
+        messages: [
+          { role: 'system', content: prompts.system },
+          { role: 'user', content: prompts.user },
+        ],
+        ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
+        ...(usesMaxCompletionTokens(provider.id, provider.model)
+          ? { max_completion_tokens: completionLimit }
+          : { max_tokens: completionLimit }),
+        ...(provider.extraBody || {}),
+      };
+
+      logLocalLlmRequest('recent-events-qa', provider.id, provider.apiUrl, provider.model);
       const resp = await fetch(provider.apiUrl, {
         method: 'POST',
         headers: { ...provider.headers, 'User-Agent': CHROME_UA },
-        body: JSON.stringify({
-          model: provider.model,
-          messages: [
-            { role: 'system', content: prompts.system },
-            { role: 'user', content: prompts.user },
-          ],
-          temperature: 0.2,
-          max_tokens: 260,
-          top_p: 0.9,
-          ...(provider.extraBody || {}),
-        }),
-        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(getProviderTimeoutMs(provider.id)),
       });
 
       if (!resp.ok) {
@@ -549,7 +585,7 @@ export default async function handler(req: Request): Promise<Response> {
         if (headlines.length === 0) {
           return {
             question,
-            answer: 'No recent event cache is available right now. Try again in a few minutes.',
+            answer: '当前暂无可用的近期事件缓存，请几分钟后再试。',
             provider: 'none',
             model: '',
             generatedAt: Date.now(),

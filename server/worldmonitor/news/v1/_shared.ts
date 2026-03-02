@@ -55,11 +55,24 @@ export function buildArticlePrompts(
   uniqueHeadlines: string[],
   opts: { mode: string; geoContext: string; variant: string; lang: string },
 ): { systemPrompt: string; userPrompt: string } {
+  const isChineseLanguage = (lang: string): boolean => {
+    const normalized = (lang || '').toLowerCase();
+    return normalized === 'zh' || normalized.startsWith('zh-');
+  };
+  const buildLanguageInstruction = (lang: string): string => {
+    const normalized = (lang || '').toLowerCase();
+    if (!normalized || normalized === 'en') return '';
+    if (isChineseLanguage(normalized)) {
+      return '\nIMPORTANT: Output the summary in Simplified Chinese (简体中文, zh-CN). Never use Traditional Chinese characters.';
+    }
+    return `\nIMPORTANT: Output the summary in ${lang.toUpperCase()} language.`;
+  };
+
   const headlineText = uniqueHeadlines.map((h, i) => `${i + 1}. ${h}`).join('\n');
   const intelSection = opts.geoContext ? `\n\n${opts.geoContext}` : '';
   const isTechVariant = opts.variant === 'tech';
   const dateContext = `Current date: ${new Date().toISOString().split('T')[0]}.${isTechVariant ? '' : ' Provide geopolitical context appropriate for the current date.'}`;
-  const langInstruction = opts.lang && opts.lang !== 'en' ? `\nIMPORTANT: Output the summary in ${opts.lang.toUpperCase()} language.` : '';
+  const langInstruction = buildLanguageInstruction(opts.lang);
 
   let systemPrompt: string;
   let userPrompt: string;
@@ -122,12 +135,15 @@ Rules:
       : `Each headline is a separate story. What's the key pattern or risk?\n${headlineText}${intelSection}`;
   } else if (opts.mode === 'translate') {
     const targetLang = opts.variant;
+    const chineseTargetRule = isChineseLanguage(targetLang)
+      ? '\n- Use Simplified Chinese (简体中文, zh-CN) only; do NOT use Traditional Chinese.'
+      : '';
     systemPrompt = `You are a professional news translator. Translate the following news headlines/summaries into ${targetLang}.
 Rules:
 - Maintain the original tone and journalistic style.
 - Do NOT add any conversational filler (e.g., "Here is the translation").
 - Output ONLY the translated text.
-- If the text is already in ${targetLang}, return it as is.`;
+- If the text is already in ${targetLang}, return it as is.${chineseTargetRule}`;
     userPrompt = `Translate to ${targetLang}:\n${headlines[0]}`;
   } else {
     systemPrompt = isTechVariant
