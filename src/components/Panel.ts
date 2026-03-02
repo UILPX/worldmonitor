@@ -220,10 +220,14 @@ export class Panel {
 
       infoBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        tooltip.classList.toggle('visible');
+        const isVisible = tooltip.classList.toggle('visible');
+        this.element.classList.toggle('panel-tooltip-open', isVisible);
       });
 
-      this.tooltipCloseHandler = () => tooltip.classList.remove('visible');
+      this.tooltipCloseHandler = () => {
+        tooltip.classList.remove('visible');
+        this.element.classList.remove('panel-tooltip-open');
+      };
       document.addEventListener('click', this.tooltipCloseHandler);
 
       const infoWrapper = document.createElement('div');

@@ -97,17 +97,7 @@ export class SecurityAdvisoriesPanel extends Panel {
   }
 
   private formatTime(date: Date): string {
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(minutes / 60);
-    const days = Math.floor(hours / 24);
-
-    if (minutes < 1) return t('components.securityAdvisories.time.justNow');
-    if (minutes < 60) return t('components.securityAdvisories.time.minutesAgo', { count: String(minutes) });
-    if (hours < 24) return t('components.securityAdvisories.time.hoursAgo', { count: String(hours) });
-    if (days < 7) return t('components.securityAdvisories.time.daysAgo', { count: String(days) });
-    return date.toLocaleDateString();
+    return date.toLocaleString();
   }
 
   private render(): void {

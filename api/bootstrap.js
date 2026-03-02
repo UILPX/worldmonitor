@@ -21,7 +21,43 @@ const BOOTSTRAP_CACHE_KEYS = {
   wildfires:        'wildfire:fires:v1',
 };
 
+const FEATURE_SECRET_REQUIREMENTS = {
+  aiOllama: ['OLLAMA_API_URL', 'OLLAMA_MODEL'],
+  aiOpenAI: ['OPENAI_API_KEY'],
+  aiGroq: ['GROQ_API_KEY'],
+  aiOpenRouter: ['OPENROUTER_API_KEY'],
+  economicFred: ['FRED_API_KEY'],
+  energyEia: ['EIA_API_KEY'],
+  internetOutages: ['CLOUDFLARE_API_TOKEN'],
+  acledConflicts: ['ACLED_ACCESS_TOKEN'],
+  abuseChThreatIntel: ['URLHAUS_AUTH_KEY'],
+  alienvaultOtxThreatIntel: ['OTX_API_KEY'],
+  abuseIpdbThreatIntel: ['ABUSEIPDB_API_KEY'],
+  wingbitsEnrichment: ['WINGBITS_API_KEY'],
+  aisRelay: ['WS_RELAY_URL', 'AISSTREAM_API_KEY'],
+  openskyRelay: ['VITE_OPENSKY_RELAY_URL', 'OPENSKY_CLIENT_ID', 'OPENSKY_CLIENT_SECRET'],
+  finnhubMarkets: ['FINNHUB_API_KEY'],
+  nasaFirms: ['NASA_FIRMS_API_KEY'],
+  wtoTrade: ['WTO_API_KEY'],
+  supplyChain: ['FRED_API_KEY'],
+  newsPerFeedFallback: [],
+  aviationStack: ['AVIATIONSTACK_API'],
+  icaoNotams: ['ICAO_API_KEY'],
+};
+
 const NEG_SENTINEL = '__WM_NEG__';
+
+function hasEnvSecret(key) {
+  return typeof process.env[key] === 'string' && process.env[key].trim().length > 0;
+}
+
+function computeFeatureAvailability() {
+  const features = {};
+  for (const [featureId, requiredSecrets] of Object.entries(FEATURE_SECRET_REQUIREMENTS)) {
+    features[featureId] = requiredSecrets.every(hasEnvSecret);
+  }
+  return features;
+}
 
 async function getCachedJsonBatch(keys) {
   const result = new Map();
@@ -72,6 +108,7 @@ export default async function handler(req) {
 
   const url = new URL(req.url);
   const requested = url.searchParams.get('keys')?.split(',').filter(Boolean);
+  const capabilities = { features: computeFeatureAvailability() };
   const registry = requested
     ? Object.fromEntries(Object.entries(BOOTSTRAP_CACHE_KEYS).filter(([k]) => requested.includes(k)))
     : BOOTSTRAP_CACHE_KEYS;
@@ -83,7 +120,7 @@ export default async function handler(req) {
   try {
     cached = await getCachedJsonBatch(keys);
   } catch {
-    return new Response(JSON.stringify({ data: {}, missing: names }), {
+    return new Response(JSON.stringify({ data: {}, missing: names, capabilities }), {
       status: 200,
       headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
     });
@@ -97,7 +134,7 @@ export default async function handler(req) {
     else missing.push(names[i]);
   }
 
-  return new Response(JSON.stringify({ data, missing }), {
+  return new Response(JSON.stringify({ data, missing, capabilities }), {
     status: 200,
     headers: {
       ...cors,

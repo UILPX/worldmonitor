@@ -435,15 +435,7 @@ export class StrategicRiskPanel extends Panel {
   }
 
   private formatTime(date: Date): string {
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(minutes / 60);
-
-    if (minutes < 1) return t('components.strategicRisk.time.justNow');
-    if (minutes < 60) return t('components.strategicRisk.time.minutesAgo', { count: String(minutes) });
-    if (hours < 24) return t('components.strategicRisk.time.hoursAgo', { count: String(hours) });
-    return date.toLocaleDateString();
+    return date.toLocaleString();
   }
 
   private render(): void {

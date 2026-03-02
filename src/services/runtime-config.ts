@@ -2,6 +2,7 @@ import { getApiBaseUrl, isDesktopRuntime } from './runtime';
 import { invokeTauri } from './tauri-bridge';
 
 export type RuntimeSecretKey =
+  | 'OPENAI_API_KEY'
   | 'GROQ_API_KEY'
   | 'OPENROUTER_API_KEY'
   | 'FRED_API_KEY'
@@ -28,6 +29,7 @@ export type RuntimeSecretKey =
   | 'ICAO_API_KEY';
 
 export type RuntimeFeatureId =
+  | 'aiOpenAI'
   | 'aiGroq'
   | 'aiOpenRouter'
   | 'economicFred'
@@ -77,6 +79,7 @@ function getSidecarSecretValidateUrl(): string {
 }
 
 const defaultToggles: Record<RuntimeFeatureId, boolean> = {
+  aiOpenAI: true,
   aiGroq: true,
   aiOpenRouter: true,
   economicFred: true,
@@ -106,6 +109,13 @@ export const RUNTIME_FEATURES: RuntimeFeatureDefinition[] = [
     description: 'Local LLM provider via OpenAI-compatible endpoint (Ollama or LM Studio, desktop-first).',
     requiredSecrets: ['OLLAMA_API_URL', 'OLLAMA_MODEL'],
     fallback: 'Falls back to Groq, then OpenRouter, then local browser model.',
+  },
+  {
+    id: 'aiOpenAI',
+    name: 'OpenAI summarization',
+    description: 'Cloud OpenAI provider used for AI summary generation.',
+    requiredSecrets: ['OPENAI_API_KEY'],
+    fallback: 'Falls back to Groq, OpenRouter, then local browser model.',
   },
   {
     id: 'aiGroq',
@@ -314,6 +324,7 @@ const runtimeConfig: RuntimeConfig = {
 };
 
 let localApiTokenPromise: Promise<string | null> | null = null;
+let webFeatureAvailabilityOverrides: Partial<Record<RuntimeFeatureId, boolean>> | null = null;
 
 function notifyConfigChanged(): void {
   for (const listener of listeners) listener();
@@ -377,6 +388,9 @@ export function isFeatureAvailable(featureId: RuntimeFeatureId): boolean {
   // Cloud/web deployments validate credentials server-side.
   // Desktop runtime validates local secrets client-side for capability gating.
   if (!isDesktopRuntime()) {
+    if (webFeatureAvailabilityOverrides && featureId in webFeatureAvailabilityOverrides) {
+      return webFeatureAvailabilityOverrides[featureId] !== false;
+    }
     return true;
   }
 
@@ -384,6 +398,17 @@ export function isFeatureAvailable(featureId: RuntimeFeatureId): boolean {
   if (!feature) return false;
   const secrets = feature.desktopRequiredSecrets ?? feature.requiredSecrets;
   return secrets.every(secretKey => getSecretState(secretKey).valid);
+}
+
+export function setWebFeatureAvailability(overrides: Partial<Record<RuntimeFeatureId, boolean>> | null): void {
+  if (isDesktopRuntime()) return;
+  if (!overrides || Object.keys(overrides).length === 0) {
+    webFeatureAvailabilityOverrides = null;
+    notifyConfigChanged();
+    return;
+  }
+  webFeatureAvailabilityOverrides = { ...overrides };
+  notifyConfigChanged();
 }
 
 export function getEffectiveSecrets(feature: RuntimeFeatureDefinition): RuntimeSecretKey[] {

@@ -32,42 +32,52 @@ async function fetchWithTimeout(url, options, timeoutMs = 15000) {
 }
 
 export default async function handler(req) {
+  const startedAt = Date.now();
+  const pathname = (() => {
+    try { return new URL(req.url).pathname; } catch { return '/api/ais-snapshot'; }
+  })();
+  const finish = (response, detail = '') => {
+    const ms = Date.now() - startedAt;
+    const state = response.status >= 200 && response.status < 300 ? 'OK' : 'FAIL';
+    console.info(`[API][ais-snapshot] ${req.method || 'GET'} ${pathname} -> ${response.status} ${state} (${ms}ms)${detail ? ` | ${detail}` : ''}`);
+    return response;
+  };
   const corsHeaders = getCorsHeaders(req, 'GET, OPTIONS');
 
   if (isDisallowedOrigin(req)) {
-    return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+    return finish(new Response(JSON.stringify({ error: 'Origin not allowed' }), {
       status: 403,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    }), 'origin blocked');
   }
 
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return finish(new Response(null, { status: 204, headers: corsHeaders }), 'preflight');
   }
   if (req.method !== 'GET') {
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+    return finish(new Response(JSON.stringify({ error: 'Method not allowed' }), {
       status: 405,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    }), 'method not allowed');
   }
 
   const keyCheck = validateApiKey(req);
   if (keyCheck.required && !keyCheck.valid) {
-    return new Response(JSON.stringify({ error: keyCheck.error }), {
+    return finish(new Response(JSON.stringify({ error: keyCheck.error }), {
       status: 401,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    }), 'invalid api key');
   }
 
   const rateLimitResponse = await checkRateLimit(req, corsHeaders);
-  if (rateLimitResponse) return rateLimitResponse;
+  if (rateLimitResponse) return finish(rateLimitResponse, 'rate limited');
 
   const relayBaseUrl = getRelayBaseUrl();
   if (!relayBaseUrl) {
-    return new Response(JSON.stringify({ error: 'WS_RELAY_URL is not configured' }), {
+    return finish(new Response(JSON.stringify({ error: 'WS_RELAY_URL is not configured' }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    }), 'missing WS_RELAY_URL');
   }
 
   try {
@@ -88,18 +98,18 @@ export default async function handler(req) {
       ...corsHeaders,
     };
 
-    return new Response(body, {
+    return finish(new Response(body, {
       status: response.status,
       headers,
-    });
+    }), `upstream=${response.status}`);
   } catch (error) {
     const isTimeout = error?.name === 'AbortError';
-    return new Response(JSON.stringify({
+    return finish(new Response(JSON.stringify({
       error: isTimeout ? 'Relay timeout' : 'Relay request failed',
       details: error?.message || String(error),
     }), {
       status: isTimeout ? 504 : 502,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    }), isTimeout ? 'relay timeout' : 'relay fetch failed');
   }
 }

@@ -1,6 +1,12 @@
 import type { BreakingAlert } from '@/services/breaking-news-alerts';
 import { getAlertSettings } from '@/services/breaking-news-alerts';
-import { getSourcePanelId } from '@/config/feeds';
+import {
+  getSourcePanelId,
+  REGIONAL_NEWS_FEED_KEYS,
+  REGIONAL_NEWS_SELECTION_STORAGE_KEY,
+  REGIONAL_NEWS_SELECTION_EVENT,
+  type RegionalNewsFeedKey,
+} from '@/config/feeds';
 import { t } from '@/services/i18n';
 
 const MAX_ALERTS = 3;
@@ -176,11 +182,26 @@ export class BreakingNewsBanner {
   }
 
   private scrollToPanel(panelId: string): void {
-    const panel = document.querySelector(`[data-panel="${panelId}"]`);
+    const hasRegionalPanel = !!document.querySelector('[data-panel="regional-news"]');
+    const shouldUseRegionalPanel = hasRegionalPanel && this.isRegionalNewsCategory(panelId);
+    const targetPanelId = shouldUseRegionalPanel ? 'regional-news' : panelId;
+    if (shouldUseRegionalPanel) {
+      this.selectRegionalNewsCategory(panelId);
+    }
+    const panel = document.querySelector(`[data-panel="${targetPanelId}"]`);
     if (!panel) return;
     panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
     panel.classList.add('flash-highlight');
     setTimeout(() => panel.classList.remove('flash-highlight'), 1500);
+  }
+
+  private isRegionalNewsCategory(panelId: string): panelId is RegionalNewsFeedKey {
+    return REGIONAL_NEWS_FEED_KEYS.includes(panelId as RegionalNewsFeedKey);
+  }
+
+  private selectRegionalNewsCategory(category: RegionalNewsFeedKey): void {
+    localStorage.setItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY, category);
+    window.dispatchEvent(new CustomEvent(REGIONAL_NEWS_SELECTION_EVENT, { detail: { category } }));
   }
 
   private createAlertElement(alert: BreakingAlert): HTMLElement {
@@ -232,10 +253,7 @@ export class BreakingNewsBanner {
   }
 
   private formatTimeAgo(date: Date): string {
-    const ms = Date.now() - date.getTime();
-    if (ms < 60_000) return t('components.intelligenceFindings.time.justNow');
-    if (ms < 3_600_000) return t('components.intelligenceFindings.time.minutesAgo', { count: String(Math.floor(ms / 60_000)) });
-    return t('components.intelligenceFindings.time.hoursAgo', { count: String(Math.floor(ms / 3_600_000)) });
+    return date.toLocaleString();
   }
 
   private dismissAlert(id: string): void {

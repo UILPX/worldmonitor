@@ -3309,8 +3309,8 @@ cd worldmonitor
 # Install everything (buf, sebuf plugins, npm deps, proto deps)
 make install
 
-# Start development server
-npm run dev
+# Start full local stack (frontend + Vercel API routes)
+cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
 
 # Build for production
 npm run build
@@ -3885,7 +3885,7 @@ Contributions are welcome! Whether you're fixing bugs, adding features, improvin
    ```
 5. **Start the development server**:
    ```bash
-   npm run dev
+   cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
    ```
 
 ### Code Style & Conventions

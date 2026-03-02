@@ -146,6 +146,8 @@
   },
   "panels": {
     "liveNews": "Live News",
+    "timelineBriefs": "AI Timeline Briefs",
+    "recentEventsQa": "AI Recent Events Q&A",
     "markets": "Markets",
     "map": "Global Situation",
     "techMap": "Global Tech",
@@ -158,6 +160,7 @@
     "intel": "Intel Feed",
     "gdeltIntel": "Live Intelligence",
     "cascade": "Infrastructure Cascade",
+    "regionalNews": "Regional News",
     "politics": "World News",
     "us": "United States",
     "europe": "Europe",
@@ -503,6 +506,40 @@
     }
   },
   "components": {
+    "regionalNews": {
+      "selectRegion": "Select region"
+    },
+    "timelineBriefs": {
+      "tenMinutes": "10-Minute Brief",
+      "oneHour": "1-Hour Brief",
+      "twelveHours": "12-Hour Brief",
+      "everyTenMinutes": "Every 10 minutes",
+      "everyHour": "Top of each hour",
+      "nyTwiceDaily": "08:00 / 20:00 New York",
+      "window": "Window",
+      "updated": "Updated",
+      "headlines": "Headlines",
+      "unavailable": "Timeline brief unavailable"
+    },
+    "recentEventsQa": {
+      "placeholder": "Ask about what happened recently (Ctrl/Cmd + Enter to send)",
+      "ask": "Ask",
+      "asking": "Asking...",
+      "empty": "Ask a question to summarize the latest cached events.",
+      "failed": "Q&A request failed. Please try again.",
+      "noProvider": "No AI provider configured for Q&A.",
+      "minQuestion": "Please enter at least 3 characters.",
+      "rateLimited": "Rate limited. Try again in {{seconds}}s.",
+      "updated": "Updated",
+      "window": "Window",
+      "headlines": "Headlines used",
+      "contextChars": "Context chars",
+      "provider": "Provider",
+      "hintCache": "Context from recent-event cache",
+      "hintRateLimit": "Rate-limited globally and per visitor",
+      "ready": "Ready",
+      "infoTooltip": "Ask questions about recent events. Answers are generated from cached recent headlines only. Context size and request rate are constrained for stability."
+    },
     "webcams": {
       "regions": {
         "iran": "IRAN ATTACKS",
@@ -565,6 +602,7 @@
       "awards": "awards",
       "noIndicatorData": "No indicator data yet - FRED may be loading",
       "fredKeyMissing": "FRED API key required — add it in Settings to enable economic indicators",
+      "eiaKeyMissing": "EIA API key required — add it in Settings to enable oil analytics",
       "noOilDataRetry": "Oil data temporarily unavailable - will retry",
       "vsPreviousWeek": "vs previous week",
       "in": "in",
@@ -1287,7 +1325,7 @@
       "infoTooltip": "Real-time signals from monitored Telegram OSINT channels",
       "loading": "Connecting to Telegram relay...",
       "empty": "No messages available",
-      "disabled": "Telegram relay not active",
+      "disabled": "Telegram relay API not configured — add WS_RELAY_URL in Settings",
       "filterAll": "All",
       "filterBreaking": "Breaking",
       "filterConflict": "Conflict",

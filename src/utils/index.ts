@@ -1,22 +1,6 @@
 export function formatTime(date: Date): string {
-  const now = new Date();
-  const diff = Math.floor((now.getTime() - date.getTime()) / 1000);
-  const lang = getCurrentLanguage();
-
-  // Safe fallback if Intl is not available (though it is in all modern browsers)
-  try {
-    const rtf = new Intl.RelativeTimeFormat(lang, { numeric: 'auto' });
-
-    if (diff < 60) return rtf.format(-Math.round(diff), 'second');
-    if (diff < 3600) return rtf.format(-Math.round(diff / 60), 'minute');
-    if (diff < 86400) return rtf.format(-Math.round(diff / 3600), 'hour');
-    return rtf.format(-Math.round(diff / 86400), 'day');
-  } catch (e) {
-    if (diff < 60) return 'Just now';
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86400)}d ago`;
-  }
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString();
 }
 
 export function formatPrice(price: number): string {
@@ -173,5 +157,3 @@ export * from './analysis-constants';
 export { getCSSColor, invalidateColorCache } from './theme-colors';
 export { getStoredTheme, getCurrentTheme, setTheme, applyStoredTheme } from './theme-manager';
 export type { Theme } from './theme-manager';
-
-import { getCurrentLanguage } from '../services/i18n';

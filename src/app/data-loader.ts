@@ -11,6 +11,13 @@ import {
   SITE_VARIANT,
   LAYER_TO_SOURCE,
 } from '@/config';
+import {
+  REGIONAL_NEWS_FEED_KEYS,
+  REGIONAL_NEWS_SELECTION_STORAGE_KEY,
+  REGIONAL_NEWS_SELECTION_EVENT,
+  inferRegionalNewsFeedFromView,
+  type RegionalNewsFeedKey,
+} from '@/config/feeds';
 import { INTEL_HOTSPOTS, CONFLICT_ZONES } from '@/config/geo';
 import { tokenizeForMatch, matchKeyword } from '@/utils/keyword-match';
 import {
@@ -81,13 +88,13 @@ import { isFeatureAvailable, isFeatureEnabled } from '@/services/runtime-config'
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { t, getCurrentLanguage } from '@/services/i18n';
 import { getHydratedData } from '@/services/bootstrap';
+import { MANUAL_REFRESH_ONLY } from '@/config/request-mode';
 import { canQueueAiClassification, AI_CLASSIFY_MAX_PER_FEED } from '@/services/ai-classify-queue';
 import { classifyWithAI } from '@/services/threat-classifier';
 import { ingestHeadlines } from '@/services/trending-keywords';
 import type { ListFeedDigestResponse } from '@/generated/client/worldmonitor/news/v1/service_client';
 import type { GetSectorSummaryResponse } from '@/generated/client/worldmonitor/market/v1/service_client';
 import { maybeShowDownloadBanner } from '@/components/DownloadBanner';
-import { mountCommunityWidget } from '@/components/CommunityWidget';
 import { ResearchServiceClient } from '@/generated/client/worldmonitor/research/v1/service_client';
 import {
   MarketPanel,
@@ -105,6 +112,7 @@ import {
   DisplacementPanel,
   ClimateAnomalyPanel,
   PopulationExposurePanel,
+  TimelineBriefsPanel,
   TradePolicyPanel,
   SupplyChainPanel,
   SecurityAdvisoriesPanel,
@@ -182,16 +190,41 @@ export class DataLoaderManager implements AppModule {
   private readonly perFeedFallbackIntelFeedLimit = 6;
   private readonly perFeedFallbackBatchSize = 2;
   private lastGoodDigest: ListFeedDigestResponse | null = null;
+  private telegramPollingPausedUntil = 0;
+  private readonly handleRegionalNewsSelectionChanged = (): void => {
+    this.renderSelectedRegionalNews();
+  };
 
   constructor(ctx: AppContext, callbacks: DataLoaderCallbacks) {
     this.ctx = ctx;
     this.callbacks = callbacks;
+    window.addEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
   }
 
   init(): void {}
 
   destroy(): void {
+    window.removeEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
     stopOrefPolling();
+  }
+
+  private isRegionalNewsCategory(category: string): category is RegionalNewsFeedKey {
+    return REGIONAL_NEWS_FEED_KEYS.includes(category as RegionalNewsFeedKey);
+  }
+
+  private getSelectedRegionalNewsCategory(): RegionalNewsFeedKey {
+    const stored = localStorage.getItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && REGIONAL_NEWS_FEED_KEYS.includes(stored as RegionalNewsFeedKey)) {
+      return stored as RegionalNewsFeedKey;
+    }
+    return inferRegionalNewsFeedFromView(this.ctx.resolvedLocation);
+  }
+
+  private hasSharedRegionalPanel(category: string): boolean {
+    if (!this.isRegionalNewsCategory(category)) return false;
+    const panel = this.ctx.newsPanels[category];
+    if (!panel) return false;
+    return REGIONAL_NEWS_FEED_KEYS.some((key) => key !== category && this.ctx.newsPanels[key] === panel);
   }
 
   private async tryFetchDigest(): Promise<ListFeedDigestResponse | null> {
@@ -278,20 +311,49 @@ export class DataLoaderManager implements AppModule {
       { name: 'news', task: runGuarded('news', () => this.loadNews()) },
     ];
 
+    const isPanelEnabled = (panelId: string): boolean => this.ctx.panelSettings[panelId]?.enabled !== false;
+    const needsMarketData = isPanelEnabled('markets') || isPanelEnabled('commodities') || isPanelEnabled('heatmap');
+
     // Happy variant only loads news data -- skip all geopolitical/financial/military data
     if (SITE_VARIANT !== 'happy') {
-      tasks.push({ name: 'markets', task: runGuarded('markets', () => this.loadMarkets()) });
-      tasks.push({ name: 'predictions', task: runGuarded('predictions', () => this.loadPredictions()) });
+      if (needsMarketData && isFeatureAvailable('finnhubMarkets')) {
+        tasks.push({ name: 'markets', task: runGuarded('markets', () => this.loadMarkets()) });
+      } else if (needsMarketData) {
+        const finnhubConfigMsg = 'FINNHUB_API_KEY not configured — add in Settings';
+        this.ctx.panels['markets']?.showConfigError(finnhubConfigMsg);
+        this.ctx.panels['heatmap']?.showConfigError(finnhubConfigMsg);
+        this.ctx.panels['commodities']?.showConfigError(finnhubConfigMsg);
+      }
+      if (isPanelEnabled('polymarket')) {
+        tasks.push({ name: 'predictions', task: runGuarded('predictions', () => this.loadPredictions()) });
+      }
       tasks.push({ name: 'pizzint', task: runGuarded('pizzint', () => this.loadPizzInt()) });
-      tasks.push({ name: 'fred', task: runGuarded('fred', () => this.loadFredData()) });
-      tasks.push({ name: 'oil', task: runGuarded('oil', () => this.loadOilAnalytics()) });
-      tasks.push({ name: 'spending', task: runGuarded('spending', () => this.loadGovernmentSpending()) });
-      tasks.push({ name: 'bis', task: runGuarded('bis', () => this.loadBisData()) });
+      if (isPanelEnabled('economic')) {
+        if (isFeatureAvailable('economicFred')) {
+          tasks.push({ name: 'fred', task: runGuarded('fred', () => this.loadFredData()) });
+        }
+        if (isFeatureAvailable('energyEia')) {
+          tasks.push({ name: 'oil', task: runGuarded('oil', () => this.loadOilAnalytics()) });
+        }
+        if (!isFeatureAvailable('economicFred') && !isFeatureAvailable('energyEia')) {
+          this.ctx.panels['economic']?.showConfigError('FRED_API_KEY or EIA_API_KEY not configured — add in Settings');
+        }
+        tasks.push({ name: 'spending', task: runGuarded('spending', () => this.loadGovernmentSpending()) });
+        tasks.push({ name: 'bis', task: runGuarded('bis', () => this.loadBisData()) });
+      }
 
       // Trade policy data (FULL and FINANCE only)
       if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance') {
-        tasks.push({ name: 'tradePolicy', task: runGuarded('tradePolicy', () => this.loadTradePolicy()) });
-        tasks.push({ name: 'supplyChain', task: runGuarded('supplyChain', () => this.loadSupplyChain()) });
+        if (isPanelEnabled('trade-policy') && isFeatureAvailable('wtoTrade')) {
+          tasks.push({ name: 'tradePolicy', task: runGuarded('tradePolicy', () => this.loadTradePolicy()) });
+        } else if (isPanelEnabled('trade-policy')) {
+          this.ctx.panels['trade-policy']?.showConfigError('WTO_API_KEY not configured — add in Settings');
+        }
+        if (isPanelEnabled('supply-chain') && isFeatureAvailable('supplyChain')) {
+          tasks.push({ name: 'supplyChain', task: runGuarded('supplyChain', () => this.loadSupplyChain()) });
+        } else if (isPanelEnabled('supply-chain')) {
+          this.ctx.panels['supply-chain']?.showConfigError('FRED_API_KEY not configured — add in Settings');
+        }
       }
     }
 
@@ -342,12 +404,17 @@ export class DataLoaderManager implements AppModule {
 
     if (SITE_VARIANT === 'full') {
       tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
+      tasks.push({ name: 'timelineBriefs', task: runGuarded('timelineBriefs', () => this.loadTimelineBriefs()) });
     }
 
-    if (SITE_VARIANT === 'full') tasks.push({ name: 'firms', task: runGuarded('firms', () => this.loadFirmsData()) });
+    if (SITE_VARIANT === 'full' && isFeatureAvailable('nasaFirms')) {
+      tasks.push({ name: 'firms', task: runGuarded('firms', () => this.loadFirmsData()) });
+    } else if (SITE_VARIANT === 'full') {
+      this.ctx.panels['satellite-fires']?.showConfigError('NASA_FIRMS_API_KEY not configured — add in Settings');
+    }
     if (this.ctx.mapLayers.natural) tasks.push({ name: 'natural', task: runGuarded('natural', () => this.loadNatural()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.weather) tasks.push({ name: 'weather', task: runGuarded('weather', () => this.loadWeatherAlerts()) });
-    if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.ais) tasks.push({ name: 'ais', task: runGuarded('ais', () => this.loadAisSignals()) });
+    if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.ais && isFeatureAvailable('aisRelay')) tasks.push({ name: 'ais', task: runGuarded('ais', () => this.loadAisSignals()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.cables) tasks.push({ name: 'cables', task: runGuarded('cables', () => this.loadCableActivity()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.cables) tasks.push({ name: 'cableHealth', task: runGuarded('cableHealth', () => this.loadCableHealth()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.flights) tasks.push({ name: 'flights', task: runGuarded('flights', () => this.loadFlightDelays()) });
@@ -529,12 +596,20 @@ export class DataLoaderManager implements AppModule {
     this.ctx.newsByCategory[category] = items;
     const panel = this.ctx.newsPanels[category];
     if (!panel) return;
+    if (this.hasSharedRegionalPanel(category) && category !== this.getSelectedRegionalNewsCategory()) return;
     const filteredItems = this.filterItemsByTimeRange(items);
     if (filteredItems.length === 0 && items.length > 0) {
       panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
       return;
     }
     panel.renderNews(filteredItems);
+  }
+
+  public renderSelectedRegionalNews(): void {
+    const selectedCategory = this.getSelectedRegionalNewsCategory();
+    if (!(selectedCategory in this.ctx.newsByCategory)) return;
+    const items = this.ctx.newsByCategory[selectedCategory] ?? [];
+    this.renderNewsForCategory(selectedCategory, items);
   }
 
   applyTimeRangeFilterToNewsPanels(): void {
@@ -882,7 +957,6 @@ export class DataLoaderManager implements AppModule {
     this.ctx.allNews = collectedNews;
     this.ctx.initialLoadComplete = true;
     maybeShowDownloadBanner();
-    mountCommunityWidget();
     updateAndCheck([
       { type: 'news', region: 'global', count: collectedNews.length },
     ]).then(anomalies => {
@@ -902,10 +976,8 @@ export class DataLoaderManager implements AppModule {
         ? await clusterNewsHybrid(this.ctx.allNews)
         : await analysisWorker.clusterNews(this.ctx.allNews);
 
-      if (this.ctx.latestClusters.length > 0) {
-        const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
-        insightsPanel?.updateInsights(this.ctx.latestClusters);
-      }
+      const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
+      insightsPanel?.updateInsights(this.ctx.latestClusters);
 
       const geoLocated = this.ctx.latestClusters
         .filter((c): c is typeof c & { lat: number; lon: number } => c.lat != null && c.lon != null)
@@ -921,6 +993,8 @@ export class DataLoaderManager implements AppModule {
       }
     } catch (error) {
       console.error('[App] Clustering failed, clusters unchanged:', error);
+      const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
+      insightsPanel?.updateInsights([]);
     }
 
     // Happy variant: run multi-stage positive news pipeline + map layers
@@ -1017,6 +1091,12 @@ export class DataLoaderManager implements AppModule {
     } catch {
       this.ctx.statusPanel?.updateApi('CoinGecko', { status: 'error' });
     }
+  }
+
+  async loadTimelineBriefs(): Promise<void> {
+    const panel = this.ctx.panels['timeline-briefs'] as TimelineBriefsPanel | undefined;
+    if (!panel) return;
+    await panel.fetchData();
   }
 
   async loadPredictions(): Promise<void> {
@@ -1380,7 +1460,9 @@ export class DataLoaderManager implements AppModule {
           this.ctx.intelligenceCache.orefAlerts = { alertCount: updAlerts, historyCount24h: updHistory };
           if (update.alerts?.length) dispatchOrefBreakingAlert(update.alerts);
         });
-        startOrefPolling();
+        if (!MANUAL_REFRESH_ONLY) {
+          startOrefPolling();
+        }
       } catch (error) {
         console.error('[Intelligence] OREF alerts fetch failed:', error);
       }
@@ -1790,6 +1872,12 @@ export class DataLoaderManager implements AppModule {
 
   async loadFredData(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
+    if (!isFeatureAvailable('economicFred')) {
+      economicPanel?.showConfigError('FRED_API_KEY not configured — add in Settings');
+      economicPanel?.setErrorState(true, 'FRED_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
+      return;
+    }
     const cbInfo = getCircuitBreakerCooldownInfo('FRED Economic');
     if (cbInfo.onCooldown) {
       economicPanel?.setErrorState(true, `Temporarily unavailable (retry in ${cbInfo.remainingSeconds}s)`);
@@ -1856,6 +1944,13 @@ export class DataLoaderManager implements AppModule {
 
   async loadOilAnalytics(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
+    if (!isFeatureAvailable('energyEia')) {
+      economicPanel?.showConfigError('EIA_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('EIA', { status: 'error' });
+      dataFreshness.recordError('oil', 'EIA_API_KEY not configured — add in Settings');
+      economicPanel?.setLoading(false);
+      return;
+    }
     try {
       const data = await fetchOilAnalytics();
       economicPanel?.updateOil(data);
@@ -1912,6 +2007,12 @@ export class DataLoaderManager implements AppModule {
   async loadTradePolicy(): Promise<void> {
     const tradePanel = this.ctx.panels['trade-policy'] as TradePolicyPanel | undefined;
     if (!tradePanel) return;
+    if (!isFeatureAvailable('wtoTrade')) {
+      tradePanel.showConfigError('WTO_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('WTO', { status: 'error' });
+      dataFreshness.recordError('wto_trade', 'WTO_API_KEY not configured — add in Settings');
+      return;
+    }
 
     try {
       const [restrictions, tariffs, flows, barriers] = await Promise.all([
@@ -1946,6 +2047,12 @@ export class DataLoaderManager implements AppModule {
   async loadSupplyChain(): Promise<void> {
     const scPanel = this.ctx.panels['supply-chain'] as SupplyChainPanel | undefined;
     if (!scPanel) return;
+    if (!isFeatureAvailable('supplyChain')) {
+      scPanel.showConfigError('FRED_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('SupplyChain', { status: 'error' });
+      dataFreshness.recordError('supply_chain', 'FRED_API_KEY not configured — add in Settings');
+      return;
+    }
 
     try {
       const [shipping, chokepoints, minerals] = await Promise.allSettled([
@@ -2022,6 +2129,11 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadFirmsData(): Promise<void> {
+    if (!isFeatureAvailable('nasaFirms')) {
+      this.ctx.panels['satellite-fires']?.showConfigError('NASA_FIRMS_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('FIRMS', { status: 'error' });
+      return;
+    }
     try {
       const fireResult = await fetchAllFires(1);
       if (fireResult.skipped) {
@@ -2277,11 +2389,19 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadTelegramIntel(): Promise<void> {
+    if (Date.now() < this.telegramPollingPausedUntil) return;
     try {
       const result = await fetchTelegramFeed();
       (this.ctx.panels['telegram-intel'] as TelegramIntelPanel)?.setData(result);
     } catch (error) {
       console.error('[App] Telegram intel fetch failed:', error);
+      const message = String(error ?? '');
+      if (/not configured|missing/i.test(message)) {
+        (this.ctx.panels['telegram-intel'] as TelegramIntelPanel | undefined)
+          ?.showConfigError('Telegram relay API not configured — add WS_RELAY_URL in Settings');
+        this.telegramPollingPausedUntil = Date.now() + 30 * 60 * 1000;
+        console.warn('[App] Telegram intel polling paused for 30 minutes due to missing configuration');
+      }
     }
   }
 }

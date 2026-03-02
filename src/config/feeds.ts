@@ -1050,6 +1050,29 @@ export const FEEDS = SITE_VARIANT === 'tech'
       ? HAPPY_FEEDS
       : FULL_FEEDS;
 
+export const WORLD_NEWS_FEED_KEY = 'politics' as const;
+export const REGIONAL_NEWS_FEED_KEYS = ['us', 'europe', 'middleeast', 'africa', 'latam', 'asia'] as const;
+export type RegionalNewsFeedKey = typeof REGIONAL_NEWS_FEED_KEYS[number];
+export const DEFAULT_REGIONAL_NEWS_FEED_KEY: RegionalNewsFeedKey = 'us';
+export const REGIONAL_NEWS_SELECTION_STORAGE_KEY = 'worldmonitor-regional-news-selection';
+export const REGIONAL_NEWS_SELECTION_EVENT = 'wm:regional-news-category-changed';
+
+const VIEW_TO_REGIONAL_NEWS: Record<string, RegionalNewsFeedKey> = {
+  america: 'us',
+  mena: 'middleeast',
+  eu: 'europe',
+  asia: 'asia',
+  latam: 'latam',
+  africa: 'africa',
+  oceania: 'asia',
+  global: DEFAULT_REGIONAL_NEWS_FEED_KEY,
+};
+
+export function inferRegionalNewsFeedFromView(view: string | null | undefined): RegionalNewsFeedKey {
+  if (!view) return DEFAULT_REGIONAL_NEWS_FEED_KEY;
+  return VIEW_TO_REGIONAL_NEWS[view] ?? DEFAULT_REGIONAL_NEWS_FEED_KEY;
+}
+
 export const SOURCE_REGION_MAP: Record<string, { labelKey: string; feedKeys: string[] }> = {
   // Full (geopolitical) variant regions
   worldwide: { labelKey: 'header.sourceRegionWorldwide', feedKeys: ['politics', 'crisis'] },

@@ -85,7 +85,7 @@ export class StatusPanel extends Panel {
         ),
       ),
       h('div', { className: 'status-panel-footer' },
-        h('span', { className: 'last-check' }, t('components.status.updatedJustNow')),
+        h('span', { className: 'last-check' }, t('components.status.updatedAt', { time: this.formatTime(new Date()) })),
       ),
     );
 
@@ -233,11 +233,7 @@ export class StatusPanel extends Panel {
   }
 
   private formatTime(date: Date): string {
-    const now = Date.now();
-    const diff = now - date.getTime();
-    if (diff < 60000) return 'just now';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleString();
   }
 
   public getElement(): HTMLElement {

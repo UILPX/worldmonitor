@@ -46,7 +46,17 @@ export async function fetchTelegramFeed(limit = 50): Promise<TelegramFeedRespons
   if (cachedResponse && Date.now() - cachedAt < CACHE_TTL) return cachedResponse;
 
   const res = await fetch(telegramFeedUrl(limit));
-  if (!res.ok) throw new Error(`Telegram feed ${res.status}`);
+  if (!res.ok) {
+    const raw = await res.text();
+    let detail = '';
+    try {
+      const parsed = JSON.parse(raw) as { error?: string; reason?: string };
+      detail = String(parsed.error || parsed.reason || '').trim();
+    } catch {
+      detail = raw.trim();
+    }
+    throw new Error(`Telegram feed ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
 
   const json: TelegramFeedResponse = await res.json();
   cachedResponse = json;
@@ -55,14 +65,7 @@ export async function fetchTelegramFeed(limit = 50): Promise<TelegramFeedRespons
 }
 
 export function formatTelegramTime(ts: string): string {
-  const diff = Date.now() - new Date(ts).getTime();
-  if (diff < 0) return 'now';
-  const secs = Math.floor(diff / 1000);
-  if (secs < 60) return `${secs}s`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d`;
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString();
 }

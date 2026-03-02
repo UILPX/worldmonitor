@@ -72,6 +72,8 @@ const RELAY_RSS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_RSS_RA
   ? Number(process.env.RELAY_RSS_RATE_LIMIT_MAX) : 300;
 const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTTLE_MS || 10000));
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
+const RELAY_VERBOSE_HTTP = process.env.RELAY_VERBOSE_HTTP === 'true'
+  || (!IS_PRODUCTION_RELAY && process.env.RELAY_VERBOSE_HTTP !== 'false');
 
 // OREF (Israel Home Front Command) siren alerts — fetched via HTTP proxy (Israel exit)
 const OREF_PROXY_AUTH = process.env.OREF_PROXY_AUTH || ''; // format: user:pass@host:port
@@ -2840,8 +2842,27 @@ function getCorsOrigin(req) {
   return '';
 }
 
+function truncateForLog(input, max = 180) {
+  const str = String(input || '');
+  if (str.length <= max) return str;
+  return `${str.slice(0, max - 3)}...`;
+}
+
+let relayHttpReqSeq = 0;
+
 const server = http.createServer(async (req, res) => {
+  const reqId = ++relayHttpReqSeq;
+  const startedAt = Date.now();
+  const rawUrl = req.url || '/';
   const pathname = (req.url || '/').split('?')[0];
+  if (RELAY_VERBOSE_HTTP) {
+    res.on('finish', () => {
+      const ms = Date.now() - startedAt;
+      const status = Number(res.statusCode || 0);
+      const state = status >= 200 && status < 300 ? 'OK' : 'FAIL';
+      console.log(`[Relay][HTTP#${reqId}] ${req.method || 'GET'} ${truncateForLog(rawUrl)} -> ${status} ${state} (${ms}ms)`);
+    });
+  }
   const corsOrigin = getCorsOrigin(req);
   if (corsOrigin) {
     res.setHeader('Access-Control-Allow-Origin', corsOrigin);
@@ -3445,6 +3466,7 @@ const wss = new WebSocketServer({ server });
 
 server.listen(PORT, () => {
   console.log(`[Relay] WebSocket relay on port ${PORT}`);
+  console.log(`[Relay] HTTP request logging: ${RELAY_VERBOSE_HTTP ? 'enabled' : 'disabled'} (set RELAY_VERBOSE_HTTP=true|false)`);
   startTelegramPollLoop();
   startOrefPollLoop();
 });

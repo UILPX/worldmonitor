@@ -22,6 +22,13 @@ import { trackSearchResultSelected, trackCountrySelected } from '@/services/anal
 import { t } from '@/services/i18n';
 import { saveToStorage, setTheme } from '@/utils';
 import { CountryIntelManager } from '@/app/country-intel';
+import {
+  getSourcePanelId,
+  REGIONAL_NEWS_FEED_KEYS,
+  REGIONAL_NEWS_SELECTION_STORAGE_KEY,
+  REGIONAL_NEWS_SELECTION_EVENT,
+  type RegionalNewsFeedKey,
+} from '@/config/feeds';
 
 export interface SearchManagerCallbacks {
   openCountryBriefByCode: (code: string, country: string) => void;
@@ -234,7 +241,7 @@ export class SearchManager implements AppModule {
     switch (result.type) {
       case 'news': {
         const item = result.data as NewsItem;
-        this.scrollToPanel('politics');
+        this.scrollToPanel(getSourcePanelId(item.source));
         this.highlightNewsItem(item.link);
         break;
       }
@@ -483,12 +490,27 @@ export class SearchManager implements AppModule {
   }
 
   private scrollToPanel(panelId: string): void {
-    const panel = document.querySelector(`[data-panel="${panelId}"]`);
+    const hasRegionalPanel = !!document.querySelector('[data-panel="regional-news"]');
+    const shouldUseRegionalPanel = hasRegionalPanel && this.isRegionalNewsCategory(panelId);
+    const targetPanelId = shouldUseRegionalPanel ? 'regional-news' : panelId;
+    if (shouldUseRegionalPanel) {
+      this.selectRegionalNewsCategory(panelId);
+    }
+    const panel = document.querySelector(`[data-panel="${targetPanelId}"]`);
     if (panel) {
       panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
       panel.classList.add('flash-highlight');
       setTimeout(() => panel.classList.remove('flash-highlight'), 1500);
     }
+  }
+
+  private isRegionalNewsCategory(panelId: string): panelId is RegionalNewsFeedKey {
+    return REGIONAL_NEWS_FEED_KEYS.includes(panelId as RegionalNewsFeedKey);
+  }
+
+  private selectRegionalNewsCategory(category: RegionalNewsFeedKey): void {
+    localStorage.setItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY, category);
+    window.dispatchEvent(new CustomEvent(REGIONAL_NEWS_SELECTION_EVENT, { detail: { category } }));
   }
 
   private highlightNewsItem(itemId: string): void {

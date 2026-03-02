@@ -1384,12 +1384,14 @@ Transactions are sampled at 10% to balance observability with cost. Release trac
 git clone https://github.com/koala73/worldmonitor.git
 cd worldmonitor
 npm install
-vercel dev       # Runs frontend + all 60+ API edge functions
+cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
 ```
 
 Open [http://localhost:3000](http://localhost:3000)
 
 > **Note**: `vercel dev` requires the [Vercel CLI](https://vercel.com/docs/cli) (`npm i -g vercel`). If you use `npm run dev` instead, only the frontend starts — news feeds and API-dependent panels won't load. See [Self-Hosting](#self-hosting) for details.
+>
+> If you hit `EPERM: operation not permitted, scandir '/Users/xp/.Trash/'`, start from the project directory using the one-line command above.
 
 ### Environment Variables (Optional)
 
@@ -1404,7 +1406,7 @@ The `.env.example` file documents every variable with descriptions and registrat
 | Group             | Variables                                                                  | Free Tier                                  |
 | ----------------- | -------------------------------------------------------------------------- | ------------------------------------------ |
 | **AI (Local)**    | `OLLAMA_API_URL`, `OLLAMA_MODEL`                                           | Free (runs on your hardware)               |
-| **AI (Cloud)**    | `GROQ_API_KEY`, `OPENROUTER_API_KEY`                                       | 14,400 req/day (Groq), 50/day (OpenRouter) |
+| **AI (Cloud)**    | `OPENAI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`                     | Paid usage (OpenAI), free tiers for Groq/OpenRouter |
 | **Cache**         | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`                       | 10K commands/day                           |
 | **Markets**       | `FINNHUB_API_KEY`, `FRED_API_KEY`, `EIA_API_KEY`                           | All free tier                              |
 | **Tracking**      | `WINGBITS_API_KEY`, `AISSTREAM_API_KEY`                                    | Free                                       |
@@ -1439,7 +1441,7 @@ To run everything locally (frontend + edge functions):
 ```bash
 npm install -g vercel
 cp .env.example .env.local   # Add your API keys
-vercel dev                   # Starts on http://localhost:3000
+cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
 ```
 
 > **Important**: Use `vercel dev` instead of `npm run dev`. The Vercel CLI emulates the edge runtime locally so all `api/` endpoints work. Plain `npm run dev` only starts Vite and the API layer won't be available.
@@ -1471,6 +1473,9 @@ The Railway relay is a multi-protocol gateway that handles data sources requirin
 ```bash
 # On Railway, deploy with:
 node scripts/ais-relay.cjs
+
+# Local (loads API keys from .env.local), default port :3004
+cd /Users/xp/Code/worldmonitor && set -a && source .env.local && set +a && node scripts/ais-relay.cjs
 ```
 
 | Service                 | Protocol        | Purpose                                                              |

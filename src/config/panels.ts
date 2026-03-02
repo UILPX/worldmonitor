@@ -10,6 +10,8 @@ import { SITE_VARIANT } from './variant';
 const FULL_PANELS: Record<string, PanelConfig> = {
   map: { name: 'Global Map', enabled: true, priority: 1 },
   'live-news': { name: 'Live News', enabled: true, priority: 1 },
+  'timeline-briefs': { name: 'Timeline Briefs', enabled: true, priority: 1 },
+  'recent-events-qa': { name: 'Recent Events Q&A', enabled: true, priority: 1 },
   'live-webcams': { name: 'Live Webcams', enabled: true, priority: 1 },
   insights: { name: 'AI Insights', enabled: true, priority: 1 },
   'strategic-posture': { name: 'AI Strategic Posture', enabled: true, priority: 1 },
@@ -19,12 +21,7 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   'gdelt-intel': { name: 'Live Intelligence', enabled: true, priority: 1 },
   cascade: { name: 'Infrastructure Cascade', enabled: true, priority: 1 },
   politics: { name: 'World News', enabled: true, priority: 1 },
-  us: { name: 'United States', enabled: true, priority: 1 },
-  europe: { name: 'Europe', enabled: true, priority: 1 },
-  middleeast: { name: 'Middle East', enabled: true, priority: 1 },
-  africa: { name: 'Africa', enabled: true, priority: 1 },
-  latam: { name: 'Latin America', enabled: true, priority: 1 },
-  asia: { name: 'Asia-Pacific', enabled: true, priority: 1 },
+  'regional-news': { name: 'Regional News', enabled: true, priority: 1 },
   energy: { name: 'Energy & Resources', enabled: true, priority: 1 },
   gov: { name: 'Government', enabled: true, priority: 1 },
   thinktanks: { name: 'Think Tanks', enabled: true, priority: 1 },
@@ -590,7 +587,7 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
   // All variants — essential panels
   core: {
     labelKey: 'header.panelCatCore',
-    panelKeys: ['map', 'live-news', 'live-webcams', 'insights', 'strategic-posture'],
+    panelKeys: ['map', 'live-news', 'timeline-briefs', 'recent-events-qa', 'live-webcams', 'insights', 'strategic-posture'],
   },
 
   // Full (geopolitical) variant
@@ -601,7 +598,7 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
   },
   regionalNews: {
     labelKey: 'header.panelCatRegionalNews',
-    panelKeys: ['politics', 'us', 'europe', 'middleeast', 'africa', 'latam', 'asia'],
+    panelKeys: ['politics', 'regional-news'],
     variants: ['full'],
   },
   marketsFinance: {

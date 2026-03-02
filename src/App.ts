@@ -24,12 +24,14 @@ import type { MacroSignalsPanel } from '@/components/MacroSignalsPanel';
 import type { StrategicPosturePanel } from '@/components/StrategicPosturePanel';
 import type { StrategicRiskPanel } from '@/components/StrategicRiskPanel';
 import { isDesktopRuntime } from '@/services/runtime';
+import { isFeatureAvailable, setWebFeatureAvailability, type RuntimeFeatureId } from '@/services/runtime-config';
 import { BETA_MODE } from '@/config/beta';
 import { trackEvent, trackDeeplinkOpened } from '@/services/analytics';
 import { preloadCountryGeometry, getCountryNameByCode } from '@/services/country-geometry';
 import { initI18n } from '@/services/i18n';
+import { MANUAL_REFRESH_ONLY } from '@/config/request-mode';
 
-import { fetchBootstrapData } from '@/services/bootstrap';
+import { fetchBootstrapData, getBootstrapCapabilities } from '@/services/bootstrap';
 import { DesktopUpdater } from '@/app/desktop-updater';
 import { CountryIntelManager } from '@/app/country-intel';
 import { SearchManager } from '@/app/search-manager';
@@ -40,6 +42,19 @@ import { EventHandlerManager } from '@/app/event-handlers';
 import { resolveUserRegion } from '@/utils/user-location';
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
+const TRIMMED_PANEL_IDS = new Set(['github']);
+
+type PanelFeatureRequirement = {
+  allOf?: RuntimeFeatureId[];
+  anyOf?: RuntimeFeatureId[];
+};
+
+const PANEL_FEATURE_REQUIREMENTS: Record<string, PanelFeatureRequirement> = {
+  markets: { allOf: ['finnhubMarkets'] },
+  economic: { anyOf: ['economicFred', 'energyEia'] },
+  'trade-policy': { allOf: ['wtoTrade'] },
+  'supply-chain': { allOf: ['supplyChain'] },
+};
 
 export type { CountryBriefSignals } from '@/app/app-context';
 
@@ -177,6 +192,11 @@ export class App {
       runtimePanel.enabled = true;
       panelSettings['runtime-config'] = runtimePanel;
       saveToStorage(STORAGE_KEYS.panels, panelSettings);
+    }
+
+    for (const panelId of TRIMMED_PANEL_IDS) {
+      const config = panelSettings[panelId];
+      if (config) config.enabled = false;
     }
 
     let initialUrlState: ParsedMapUrlState | null = parseMapUrlState(window.location.search, mapLayers);
@@ -342,15 +362,18 @@ export class App {
       }
     });
 
-    // Check AIS configuration before init
+    // Hydrate in-memory cache from bootstrap endpoint (before panels construct and fetch)
+    await fetchBootstrapData();
+    const bootstrapCapabilities = getBootstrapCapabilities();
+    setWebFeatureAvailability(bootstrapCapabilities?.features ?? null);
+    this.applyFeatureBasedPanelVisibility();
+
+    // Check AIS configuration after bootstrap capabilities are known
     if (!isAisConfigured()) {
       this.state.mapLayers.ais = false;
     } else if (this.state.mapLayers.ais) {
       initAisStream();
     }
-
-    // Hydrate in-memory cache from bootstrap endpoint (before panels construct and fetch)
-    await fetchBootstrapData();
 
     const resolvedRegion = await resolveUserRegion();
     this.state.resolvedLocation = resolvedRegion;
@@ -517,24 +540,48 @@ export class App {
     }
   }
 
+  private applyFeatureBasedPanelVisibility(): void {
+    for (const [panelId, requirement] of Object.entries(PANEL_FEATURE_REQUIREMENTS)) {
+      const panelConfig = this.state.panelSettings[panelId];
+      if (!panelConfig) continue;
+      if (this.isPanelRequirementSatisfied(requirement)) continue;
+      panelConfig.enabled = false;
+    }
+  }
+
+  private isPanelRequirementSatisfied(requirement: PanelFeatureRequirement): boolean {
+    if (requirement.allOf && requirement.allOf.length > 0) {
+      return requirement.allOf.every((featureId) => isFeatureAvailable(featureId));
+    }
+    if (requirement.anyOf && requirement.anyOf.length > 0) {
+      return requirement.anyOf.some((featureId) => isFeatureAvailable(featureId));
+    }
+    return true;
+  }
+
   private setupRefreshIntervals(): void {
+    if (MANUAL_REFRESH_ONLY) {
+      console.info('[App] Manual refresh mode enabled; periodic refresh scheduler disabled');
+      return;
+    }
+
     // Always refresh news for all variants
     this.refreshScheduler.scheduleRefresh('news', () => this.dataLoader.loadNews(), REFRESH_INTERVALS.feeds);
 
     // Happy variant only refreshes news -- skip all geopolitical/financial/military refreshes
     if (SITE_VARIANT !== 'happy') {
       this.refreshScheduler.registerAll([
-        { name: 'markets', fn: () => this.dataLoader.loadMarkets(), intervalMs: REFRESH_INTERVALS.markets },
+        { name: 'markets', fn: () => this.dataLoader.loadMarkets(), intervalMs: REFRESH_INTERVALS.markets, condition: () => isFeatureAvailable('finnhubMarkets') },
         { name: 'predictions', fn: () => this.dataLoader.loadPredictions(), intervalMs: REFRESH_INTERVALS.predictions },
         { name: 'pizzint', fn: () => this.dataLoader.loadPizzInt(), intervalMs: 10 * 60 * 1000 },
         { name: 'natural', fn: () => this.dataLoader.loadNatural(), intervalMs: 60 * 60 * 1000, condition: () => this.state.mapLayers.natural },
         { name: 'weather', fn: () => this.dataLoader.loadWeatherAlerts(), intervalMs: 10 * 60 * 1000, condition: () => this.state.mapLayers.weather },
-        { name: 'fred', fn: () => this.dataLoader.loadFredData(), intervalMs: 30 * 60 * 1000 },
-        { name: 'oil', fn: () => this.dataLoader.loadOilAnalytics(), intervalMs: 30 * 60 * 1000 },
+        { name: 'fred', fn: () => this.dataLoader.loadFredData(), intervalMs: 30 * 60 * 1000, condition: () => isFeatureAvailable('economicFred') },
+        { name: 'oil', fn: () => this.dataLoader.loadOilAnalytics(), intervalMs: 30 * 60 * 1000, condition: () => isFeatureAvailable('energyEia') },
         { name: 'spending', fn: () => this.dataLoader.loadGovernmentSpending(), intervalMs: 60 * 60 * 1000 },
         { name: 'bis', fn: () => this.dataLoader.loadBisData(), intervalMs: 60 * 60 * 1000 },
-        { name: 'firms', fn: () => this.dataLoader.loadFirmsData(), intervalMs: 30 * 60 * 1000 },
-        { name: 'ais', fn: () => this.dataLoader.loadAisSignals(), intervalMs: REFRESH_INTERVALS.ais, condition: () => this.state.mapLayers.ais },
+        { name: 'firms', fn: () => this.dataLoader.loadFirmsData(), intervalMs: 30 * 60 * 1000, condition: () => isFeatureAvailable('nasaFirms') },
+        { name: 'ais', fn: () => this.dataLoader.loadAisSignals(), intervalMs: REFRESH_INTERVALS.ais, condition: () => isFeatureAvailable('aisRelay') && this.state.mapLayers.ais },
         { name: 'cables', fn: () => this.dataLoader.loadCableActivity(), intervalMs: 30 * 60 * 1000, condition: () => this.state.mapLayers.cables },
         { name: 'cableHealth', fn: () => this.dataLoader.loadCableHealth(), intervalMs: 2 * 60 * 60 * 1000, condition: () => this.state.mapLayers.cables },
         { name: 'flights', fn: () => this.dataLoader.loadFlightDelays(), intervalMs: 2 * 60 * 60 * 1000, condition: () => this.state.mapLayers.flights },
@@ -583,10 +630,17 @@ export class App {
       () => !!this.state.panels['strategic-risk']
     );
 
+    this.refreshScheduler.scheduleRefresh(
+      'timeline-briefs',
+      () => this.dataLoader.loadTimelineBriefs(),
+      10 * 60_000,
+      () => SITE_VARIANT === 'full' && !!this.state.panels['timeline-briefs']
+    );
+
     // WTO trade policy data — annual data, poll every 10 min to avoid hammering upstream
     if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance') {
-      this.refreshScheduler.scheduleRefresh('tradePolicy', () => this.dataLoader.loadTradePolicy(), 10 * 60 * 1000);
-      this.refreshScheduler.scheduleRefresh('supplyChain', () => this.dataLoader.loadSupplyChain(), 10 * 60 * 1000);
+      this.refreshScheduler.scheduleRefresh('tradePolicy', () => this.dataLoader.loadTradePolicy(), 10 * 60 * 1000, () => isFeatureAvailable('wtoTrade'));
+      this.refreshScheduler.scheduleRefresh('supplyChain', () => this.dataLoader.loadSupplyChain(), 10 * 60 * 1000, () => isFeatureAvailable('supplyChain'));
     }
 
     // Telegram Intel (near real-time, 60s refresh)

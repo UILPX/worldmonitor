@@ -448,11 +448,7 @@ export class IntelligenceFindingsBadge {
   }
 
   private formatTimeAgo(date: Date): string {
-    const ms = Date.now() - date.getTime();
-    if (ms < 60000) return t('components.intelligenceFindings.time.justNow');
-    if (ms < 3600000) return t('components.intelligenceFindings.time.minutesAgo', { count: String(Math.floor(ms / 60000)) });
-    if (ms < 86400000) return t('components.intelligenceFindings.time.hoursAgo', { count: String(Math.floor(ms / 3600000)) });
-    return t('components.intelligenceFindings.time.daysAgo', { count: String(Math.floor(ms / 86400000)) });
+    return date.toLocaleString();
   }
 
   private toggleDropdown(): void {

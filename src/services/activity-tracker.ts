@@ -149,18 +149,7 @@ class ActivityTracker {
 
     const firstSeen = state.firstSeenTime.get(itemId);
     if (!firstSeen) return '';
-
-    const elapsed = Date.now() - firstSeen;
-
-    if (elapsed < 60000) {
-      return 'just now';
-    } else if (elapsed < 3600000) {
-      const mins = Math.floor(elapsed / 60000);
-      return `${mins}m ago`;
-    } else {
-      const hours = Math.floor(elapsed / 3600000);
-      return `${hours}h ago`;
-    }
+    return new Date(firstSeen).toLocaleString();
   }
 
   /**
