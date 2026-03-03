@@ -58,6 +58,19 @@ function isChineseLanguage(lang: string | undefined): boolean {
   return normalized === 'zh' || normalized.startsWith('zh-');
 }
 
+function getBrowserLanguage(): string {
+  if (typeof navigator !== 'undefined' && typeof navigator.language === 'string' && navigator.language.trim()) {
+    return navigator.language.trim();
+  }
+  return 'en';
+}
+
+function normalizeSummaryLanguage(lang: string | undefined): string {
+  const normalized = (lang || '').trim();
+  if (normalized) return normalized;
+  return getBrowserLanguage();
+}
+
 const API_PROVIDERS: ApiProviderDef[] = [
   { featureId: 'aiOllama',      provider: 'ollama',     label: 'Ollama' },
   { featureId: 'aiOpenAI',      provider: 'openai',     label: 'OpenAI' },
@@ -78,6 +91,7 @@ async function tryApiProvider(
   if (!isFeatureAvailable(providerDef.featureId)) return null;
   lastAttemptedProvider = providerDef.provider;
   try {
+    const summaryLang = normalizeSummaryLanguage(lang);
     const resp: SummarizeArticleResponse = await summaryBreakers[providerDef.provider].execute(async () => {
       return newsClient.summarizeArticle({
         provider: providerDef.provider,
@@ -85,7 +99,7 @@ async function tryApiProvider(
         mode: 'brief',
         geoContext: geoContext || '',
         variant: SITE_VARIANT,
-        lang: lang || 'en',
+        lang: summaryLang,
       });
     }, emptySummaryFallback);
 
@@ -121,11 +135,12 @@ async function tryBrowserT5(headlines: string[], modelId?: string, lang = 'en'):
       return null;
     }
     lastAttemptedProvider = 'browser';
+    const summaryLang = normalizeSummaryLanguage(lang);
 
     const combinedText = headlines.slice(0, 5).map(h => h.slice(0, 80)).join('. ');
-    const prompt = isChineseLanguage(lang)
+    const prompt = isChineseLanguage(summaryLang)
       ? `请从以下标题中提炼最重要的一条新闻，用2句简洁的简体中文总结（不超过60字），只写结论不要解释：${combinedText}`
-      : `Summarize the most important headline in 2 concise sentences (under 60 words): ${combinedText}`;
+      : `Summarize the most important headline in 2 concise sentences (under 60 words) in ${summaryLang}: ${combinedText}`;
 
     const [summary] = await mlWorker.summarize([prompt], modelId);
 
@@ -173,7 +188,7 @@ export async function generateSummary(
   headlines: string[],
   onProgress?: ProgressCallback,
   geoContext?: string,
-  lang: string = 'en',
+  lang: string = getBrowserLanguage(),
   options?: SummarizeOptions,
 ): Promise<SummarizationResult | null> {
   if (!headlines || headlines.length < 2) {
@@ -201,6 +216,7 @@ async function generateSummaryInternal(
   lang: string,
   options?: SummarizeOptions,
 ): Promise<SummarizationResult | null> {
+  const summaryLang = normalizeSummaryLanguage(lang);
   if (BETA_MODE) {
     const modelReady = mlWorker.isAvailable && mlWorker.isModelLoaded('summarization-beta');
 
@@ -209,10 +225,10 @@ async function generateSummaryInternal(
       // Model already loaded -- use browser T5-small first
       if (!options?.skipBrowserFallback) {
         onProgress?.(1, totalSteps, 'Running local AI model (beta)...');
-        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', lang);
+        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', summaryLang);
         if (browserResult) {
           const groqProvider = API_PROVIDERS.find(p => p.provider === 'groq');
-          if (groqProvider && !options?.skipCloudProviders) tryApiProvider(groqProvider, headlines, geoContext, lang).catch(() => {});
+          if (groqProvider && !options?.skipCloudProviders) tryApiProvider(groqProvider, headlines, geoContext, summaryLang).catch(() => {});
 
           return browserResult;
         }
@@ -220,7 +236,7 @@ async function generateSummaryInternal(
 
       // Warm model failed inference -- fallback through API providers
       if (!options?.skipCloudProviders) {
-        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, lang, onProgress, 2, totalSteps);
+        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, summaryLang, onProgress, 2, totalSteps);
         if (chainResult) return chainResult;
       }
     } else {
@@ -231,7 +247,7 @@ async function generateSummaryInternal(
 
       // API providers while model loads
       if (!options?.skipCloudProviders) {
-        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, lang, onProgress, 1, totalSteps);
+        const chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, summaryLang, onProgress, 1, totalSteps);
         if (chainResult) {
           return chainResult;
         }
@@ -240,7 +256,7 @@ async function generateSummaryInternal(
       // Last resort: try browser T5 (may have finished loading by now)
       if (mlWorker.isAvailable && !options?.skipBrowserFallback) {
         onProgress?.(API_PROVIDERS.length + 1, totalSteps, 'Waiting for local AI model...');
-        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', lang);
+        const browserResult = await tryBrowserT5(headlines, 'summarization-beta', summaryLang);
         if (browserResult) return browserResult;
       }
 
@@ -256,13 +272,13 @@ async function generateSummaryInternal(
   let chainResult: SummarizationResult | null = null;
 
   if (!options?.skipCloudProviders) {
-    chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, lang, onProgress, 1, totalSteps);
+    chainResult = await runApiChain(API_PROVIDERS, headlines, geoContext, summaryLang, onProgress, 1, totalSteps);
   }
   if (chainResult) return chainResult;
 
   if (!options?.skipBrowserFallback) {
     onProgress?.(totalSteps, totalSteps, 'Loading local AI model...');
-    const browserResult = await tryBrowserT5(headlines, undefined, lang);
+    const browserResult = await tryBrowserT5(headlines, undefined, summaryLang);
     if (browserResult) return browserResult;
   }
 

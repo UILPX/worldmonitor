@@ -1056,6 +1056,11 @@ export type RegionalNewsFeedKey = typeof REGIONAL_NEWS_FEED_KEYS[number];
 export const DEFAULT_REGIONAL_NEWS_FEED_KEY: RegionalNewsFeedKey = 'us';
 export const REGIONAL_NEWS_SELECTION_STORAGE_KEY = 'worldmonitor-regional-news-selection';
 export const REGIONAL_NEWS_SELECTION_EVENT = 'wm:regional-news-category-changed';
+export const FULL_FINANCE_NEWS_FEED_KEYS = ['finance', 'markets', 'commodities', 'crypto', 'economic'] as const;
+export type FullFinanceNewsFeedKey = typeof FULL_FINANCE_NEWS_FEED_KEYS[number];
+export const DEFAULT_FULL_FINANCE_NEWS_FEED_KEY: FullFinanceNewsFeedKey = 'finance';
+export const FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY = 'worldmonitor-finance-news-selection';
+export const FULL_FINANCE_NEWS_SELECTION_EVENT = 'wm:finance-news-category-changed';
 
 const VIEW_TO_REGIONAL_NEWS: Record<string, RegionalNewsFeedKey> = {
   america: 'us',

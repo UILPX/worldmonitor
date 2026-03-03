@@ -64,8 +64,13 @@ import {
   REGIONAL_NEWS_FEED_KEYS,
   REGIONAL_NEWS_SELECTION_STORAGE_KEY,
   REGIONAL_NEWS_SELECTION_EVENT,
+  FULL_FINANCE_NEWS_FEED_KEYS,
+  DEFAULT_FULL_FINANCE_NEWS_FEED_KEY,
+  FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY,
+  FULL_FINANCE_NEWS_SELECTION_EVENT,
   inferRegionalNewsFeedFromView,
   type RegionalNewsFeedKey,
+  type FullFinanceNewsFeedKey,
 } from '@/config/feeds';
 import { BETA_MODE } from '@/config/beta';
 import { t } from '@/services/i18n';
@@ -349,6 +354,81 @@ export class PanelLayoutManager implements AppModule {
     headerLeft.appendChild(select);
   }
 
+  private getFullFinanceNewsLabel(category: FullFinanceNewsFeedKey): string {
+    const labelMap: Record<FullFinanceNewsFeedKey, string> = {
+      finance: t('panels.finance'),
+      markets: t('panels.markets'),
+      commodities: t('panels.commodities'),
+      crypto: t('panels.crypto'),
+      economic: t('panels.economic'),
+    };
+    return labelMap[category];
+  }
+
+  private getSelectedFullFinanceNewsCategory(): FullFinanceNewsFeedKey {
+    const stored = localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && FULL_FINANCE_NEWS_FEED_KEYS.includes(stored as FullFinanceNewsFeedKey)) {
+      return stored as FullFinanceNewsFeedKey;
+    }
+    return DEFAULT_FULL_FINANCE_NEWS_FEED_KEY;
+  }
+
+  private setFullFinanceNewsPanelTitle(panel: NewsPanel, _category: FullFinanceNewsFeedKey): void {
+    const titleEl = panel.getElement().querySelector('.panel-title');
+    if (!titleEl) return;
+    titleEl.textContent = t('panels.finance');
+  }
+
+  private renderSelectedFullFinanceNews(panel: NewsPanel): void {
+    const category = this.getSelectedFullFinanceNewsCategory();
+    if (!(category in this.ctx.newsByCategory)) {
+      panel.showLoading();
+      return;
+    }
+    const items = this.ctx.newsByCategory[category] ?? [];
+    const filtered = this.filterItemsByTimeRange(items);
+    if (filtered.length === 0 && items.length > 0) {
+      panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
+      return;
+    }
+    panel.renderNews(filtered);
+  }
+
+  private setupFullFinanceNewsSelector(panel: NewsPanel): void {
+    const headerLeft = panel.getElement().querySelector('.panel-header-left');
+    if (!headerLeft) return;
+
+    if (!localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY)) {
+      localStorage.setItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY, DEFAULT_FULL_FINANCE_NEWS_FEED_KEY);
+    }
+
+    const category = this.getSelectedFullFinanceNewsCategory();
+    this.setFullFinanceNewsPanelTitle(panel, category);
+
+    const select = document.createElement('select');
+    select.className = 'region-select finance-news-select';
+    select.title = t('panels.finance');
+
+    for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+      const option = document.createElement('option');
+      option.value = key;
+      option.textContent = this.getFullFinanceNewsLabel(key);
+      select.appendChild(option);
+    }
+
+    select.value = category;
+    select.addEventListener('change', () => {
+      const next = select.value as FullFinanceNewsFeedKey;
+      if (!FULL_FINANCE_NEWS_FEED_KEYS.includes(next)) return;
+      localStorage.setItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY, next);
+      this.setFullFinanceNewsPanelTitle(panel, next);
+      this.renderSelectedFullFinanceNews(panel);
+      window.dispatchEvent(new CustomEvent(FULL_FINANCE_NEWS_SELECTION_EVENT, { detail: { category: next } }));
+    });
+
+    headerLeft.appendChild(select);
+  }
+
   renderCriticalBanner(postures: TheaterPostureSummary[]): void {
     if (this.ctx.isMobile) {
       if (this.criticalBannerEl) {
@@ -472,6 +552,12 @@ export class PanelLayoutManager implements AppModule {
     this.attachRelatedAssetHandlers(financePanel);
     this.ctx.newsPanels['finance'] = financePanel;
     this.ctx.panels['finance'] = financePanel;
+    if (SITE_VARIANT === 'full') {
+      for (const category of FULL_FINANCE_NEWS_FEED_KEYS) {
+        this.ctx.newsPanels[category] = financePanel;
+      }
+      this.setupFullFinanceNewsSelector(financePanel);
+    }
 
     const heatmapPanel = new HeatmapPanel();
     this.ctx.panels['heatmap'] = heatmapPanel;
@@ -808,7 +894,7 @@ export class PanelLayoutManager implements AppModule {
     }
 
     if (SITE_VARIANT !== 'happy') {
-      const preferredTopOrder = ['live-news', 'timeline-briefs', 'recent-events-qa', 'live-webcams'];
+      const preferredTopOrder = ['live-news', 'live-webcams', 'timeline-briefs', 'recent-events-qa', 'telegram-intel'];
       const top: string[] = [];
       for (const panelId of preferredTopOrder) {
         if (panelOrder.includes(panelId) && !top.includes(panelId)) {
@@ -849,12 +935,20 @@ export class PanelLayoutManager implements AppModule {
 
   private applyTimeRangeFilterToNewsPanels(): void {
     const selectedRegionalCategory = this.getSelectedRegionalNewsCategory();
+    const selectedFullFinanceCategory = this.getSelectedFullFinanceNewsCategory();
     const renderedPanels = new Set<NewsPanel>();
     Object.entries(this.ctx.newsByCategory).forEach(([category, items]) => {
       const panel = this.ctx.newsPanels[category];
       if (!panel) return;
       if (renderedPanels.has(panel)) return;
       if (REGIONAL_NEWS_FEED_KEYS.includes(category as RegionalNewsFeedKey) && category !== selectedRegionalCategory) {
+        return;
+      }
+      if (
+        SITE_VARIANT === 'full' &&
+        FULL_FINANCE_NEWS_FEED_KEYS.includes(category as FullFinanceNewsFeedKey) &&
+        category !== selectedFullFinanceCategory
+      ) {
         return;
       }
       const filtered = this.filterItemsByTimeRange(items);

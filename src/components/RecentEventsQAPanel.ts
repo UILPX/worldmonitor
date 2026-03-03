@@ -1,6 +1,6 @@
 import { Panel } from './Panel';
 import { SITE_VARIANT } from '@/config';
-import { t } from '@/services/i18n';
+import { getCurrentLanguage, t } from '@/services/i18n';
 import { h, replaceChildren } from '@/utils/dom-utils';
 
 interface RecentEventsQAResponse {
@@ -125,12 +125,16 @@ export class RecentEventsQAPanel extends Panel {
     this.render();
 
     try {
-      const resp = await fetch(`/api/recent-events-qa?variant=${encodeURIComponent(SITE_VARIANT)}`, {
+      const lang = getCurrentLanguage();
+      const resp = await fetch(
+        `/api/recent-events-qa?variant=${encodeURIComponent(SITE_VARIANT)}&lang=${encodeURIComponent(lang)}`,
+        {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, variant: SITE_VARIANT }),
+        body: JSON.stringify({ question, variant: SITE_VARIANT, lang }),
         signal: AbortSignal.timeout(35_000),
-      });
+        },
+      );
 
       if (!resp.ok) {
         const errorPayload = await resp.json().catch(() => ({})) as RecentEventsQAError;

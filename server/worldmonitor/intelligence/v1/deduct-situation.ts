@@ -9,7 +9,9 @@ import type {
 import { cachedFetchJson } from '../../../_shared/redis';
 import { hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
-import { logLocalLlmRequest } from '../../../_shared/local-llm-log';
+import { isLikelyLocalLlmUrl, logLocalLlmRequest } from '../../../_shared/local-llm-log';
+import { runWithLocalLlmQueue } from '../../../_shared/local-llm-queue';
+import { extractLlmResponseText } from '../../../_shared/llm-content';
 
 const DEDUCT_TIMEOUT_MS = 120_000;
 const DEDUCT_CACHE_TTL = 3600;
@@ -32,6 +34,18 @@ function usesOpenAiCompletionTokens(apiUrl: string, model: string): boolean {
         || normalized.startsWith('o3')
         || normalized.startsWith('o4')
     );
+}
+
+function getOllamaNoThinkPrefix(): string {
+    return '/set nothink\n';
+}
+
+function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
+    return [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: getOllamaNoThinkPrefix().trim() },
+        { role: 'user', content: userPrompt },
+    ];
 }
 
 export async function deductSituation(
@@ -67,8 +81,10 @@ Your task is to DEDUCT the situation in a near timeline (e.g. 24 hours to a few 
 - Be highly analytical, pragmatic, and objective.
 - Identify the most likely outcomes, timelines, and second-order impacts.
 - Do NOT use typical AI preambles (e.g., "Here is the deduction", "Let me see").
+- Output only the final analysis. Do not output thinking steps, reasoning process, or prompt analysis.
 - Format your response in clean markdown with concise bullet points where appropriate.`;
 
+                const localLlm = isLikelyLocalLlmUrl(apiUrl);
                 let userPrompt = query;
                 if (geoContext) {
                     userPrompt += `\n\n### Current Intelligence Context\n${geoContext}`;
@@ -77,41 +93,46 @@ Your task is to DEDUCT the situation in a near timeline (e.g. 24 hours to a few 
                 const completionLimit = 1500;
                 const payload = {
                     model,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt },
-                    ],
+                    messages: localLlm
+                        ? buildOllamaChatMessages(systemPrompt, userPrompt)
+                        : [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt },
+                        ],
                     temperature: 0.3,
+                    ...(localLlm ? { think: false } : {}),
                     ...(usesOpenAiCompletionTokens(apiUrl, model)
                         ? { max_completion_tokens: completionLimit }
                         : { max_tokens: completionLimit }),
                 };
 
-                logLocalLlmRequest('deduct-situation', 'llm', apiUrl, model);
-                const resp = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${apiKey}`,
-                        'Content-Type': 'application/json',
-                        'User-Agent': CHROME_UA
-                    },
-                    body: JSON.stringify(payload),
-                    signal: AbortSignal.timeout(parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? DEDUCT_TIMEOUT_MS),
-                });
+                const invokeProvider = async (): Promise<{ analysis: string; model: string; provider: string } | null> => {
+                    logLocalLlmRequest('deduct-situation', 'llm', apiUrl, model);
+                    const resp = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${apiKey}`,
+                            'Content-Type': 'application/json',
+                            'User-Agent': CHROME_UA
+                        },
+                        body: JSON.stringify(payload),
+                        signal: AbortSignal.timeout(parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? DEDUCT_TIMEOUT_MS),
+                    });
 
-                if (!resp.ok) return null;
-                const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
-                const firstChoice = data.choices?.[0];
+                    if (!resp.ok) return null;
 
-                const content = firstChoice?.message?.content?.trim();
-                const reasoning = (firstChoice?.message as any)?.reasoning?.trim();
+                    const data = await resp.json() as Record<string, unknown>;
+                    let raw = extractLlmResponseText(data).trim();
+                    if (!raw) return null;
 
-                let raw = content || reasoning;
-                if (!raw) return null;
+                    raw = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+                    return { analysis: raw, model, provider: 'groq' };
+                };
 
-                raw = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-
-                return { analysis: raw, model, provider: 'groq' };
+                if (localLlm) {
+                    return await runWithLocalLlmQueue('deduct-situation', invokeProvider);
+                }
+                return await invokeProvider();
             } catch (err) {
                 console.error('[DeductSituation] Error calling LLM:', err);
                 return null;

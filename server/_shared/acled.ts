@@ -33,6 +33,8 @@ const acledAuthState: AcledAuthState = {
   initializedFromEnv: false,
   refreshing: null,
 };
+let acledRefreshGrantFailureLogged = false;
+let acledPasswordGrantFailureLogged = false;
 
 export interface AcledRawEvent {
   event_id_cnty?: string;
@@ -90,10 +92,13 @@ function initializeAcledAuthStateFromEnv(): void {
 
   acledAuthState.accessToken = envToken;
   acledAuthState.refreshToken = envRefreshToken || null;
-  // When OAuth creds are present we treat env token as renewable and assume
-  // a default lifetime until the first successful refresh.
+  // If token can be renewed (refresh token or password grant creds exist),
+  // assume default lifetime and proactively refresh; otherwise keep using it
+  // until upstream returns 401.
   const hasPasswordGrantCreds = Boolean(readAcledPasswordGrantCredentials());
-  acledAuthState.expiresAt = hasPasswordGrantCreds ? Date.now() + ACLED_DEFAULT_TOKEN_TTL_MS : Number.POSITIVE_INFINITY;
+  acledAuthState.expiresAt = (envRefreshToken || hasPasswordGrantCreds)
+    ? Date.now() + ACLED_DEFAULT_TOKEN_TTL_MS
+    : Number.POSITIVE_INFINITY;
 }
 
 function resolveTokenExpiryMs(expiresInRaw: number | string | undefined): number {
@@ -167,7 +172,13 @@ async function refreshAcledToken(force: boolean): Promise<string | null> {
       process.env.ACLED_REFRESH_TOKEN = acledAuthState.refreshToken ?? '';
       return refreshed.accessToken;
     } catch (error) {
-      console.warn('[ACLED] refresh_token grant failed, falling back to password grant:', error);
+      if (!acledRefreshGrantFailureLogged) {
+        acledRefreshGrantFailureLogged = true;
+        console.error('[ACLED] refresh_token grant failed, falling back to password grant:', error);
+      }
+      // Stop retrying a known-invalid refresh token every request.
+      acledAuthState.refreshToken = null;
+      process.env.ACLED_REFRESH_TOKEN = '';
     }
   }
 
@@ -190,7 +201,10 @@ async function refreshAcledToken(force: boolean): Promise<string | null> {
     process.env.ACLED_REFRESH_TOKEN = issued.refreshToken ?? '';
     return issued.accessToken;
   } catch (error) {
-    console.warn('[ACLED] password grant failed:', error);
+    if (!acledPasswordGrantFailureLogged) {
+      acledPasswordGrantFailureLogged = true;
+      console.error('[ACLED] password grant failed:', error);
+    }
     return force ? null : acledAuthState.accessToken;
   }
 }

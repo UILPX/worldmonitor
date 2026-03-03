@@ -1464,7 +1464,7 @@ This runs the frontend without the API layer. Panels that require server-side pr
 | **Linux x86_64**       | Full support            | Works with `vercel dev` for local development. Desktop .AppImage available for x86_64. WebKitGTK rendering uses DMA-BUF with fallback to SHM for GPU compatibility. Font stack includes DejaVu Sans Mono and Liberation Mono for consistent rendering across distros |
 | **macOS**              | Works with `vercel dev` | Full local development                                                                                                         |
 | **Raspberry Pi / ARM** | Partial                 | `vercel dev` edge runtime emulation may not work on ARM. Use Option 1 (deploy to Vercel) or Option 3 (static frontend) instead |
-| **Docker**             | Planned                 | See [Roadmap](#roadmap)                                                                                                        |
+| **Docker**             | Supported (local self-host) | Use `docker compose up -d --build` with provided `docker-compose.yml`                                                      |
 
 ### Railway Relay (Optional)
 
@@ -1488,6 +1488,48 @@ cd /Users/xp/Code/worldmonitor && set -a && source .env.local && set +a && node 
 | **ICAO NOTAM**          | REST            | Airport/airspace closure detection for 46 MENA airports              |
 
 Set `WS_RELAY_URL` (server-side, HTTPS) and `VITE_WS_RELAY_URL` (client-side, WSS) in your environment. Without the relay, AIS, OpenSky, Telegram, and OREF layers won't show live data, but all other features work normally.
+
+### Docker Local Deployment (Windows / macOS / Linux)
+
+This repository includes Docker assets for running both services together:
+
+- `web`: Vercel edge-runtime dev server on port `3000`
+- `relay`: AIS/OpenSky/Telegram relay on port `3004`
+
+```bash
+# In repo root
+# Build/create only (do NOT start containers)
+docker compose up --build --no-start
+
+# Start later when needed
+docker compose start web relay
+```
+
+Open <http://localhost:3000>.
+
+Useful commands:
+
+```bash
+# View logs
+docker compose logs -f web relay
+
+# Restart one service
+docker compose restart web
+docker compose restart relay
+
+# Stop services
+docker compose down
+```
+
+Notes:
+
+- `web` builds one image (`worldmonitor-app:local`), and `relay` reuses the same image (two containers, one image).
+- `docker-compose.yml` pins both services to `platform: linux/amd64` (for Windows x64 compatibility).
+- `docker compose up --build --no-start` builds successfully without auto-running containers.
+- `docker-compose.yml` overrides `WS_RELAY_URL` to `http://relay:3004` for server-side calls.
+- Browser-side relay URLs are set to `localhost:3004`.
+- Relay cache persistence is stored in Docker volume `relay-cache` mounted to `/app/tmp/relay-cache`.
+- Configure `OLLAMA_API_URL` in `.env.local` (for example `http://192.168.10.80:11434` for a LAN Ollama host).
 
 ---
 

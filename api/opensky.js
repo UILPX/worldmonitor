@@ -1,6 +1,7 @@
 import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 
 export const config = { runtime: 'edge' };
+const API_VERBOSE_LOGS = process.env.API_VERBOSE_LOGS === 'true';
 
 function getRelayBaseUrl() {
   const relayUrl = process.env.WS_RELAY_URL;
@@ -35,9 +36,11 @@ export default async function handler(req) {
     try { return new URL(req.url).pathname; } catch { return '/api/opensky'; }
   })();
   const finish = (response, detail = '') => {
-    const ms = Date.now() - startedAt;
-    const state = response.status >= 200 && response.status < 300 ? 'OK' : 'FAIL';
-    console.info(`[API][opensky] ${req.method || 'GET'} ${pathname} -> ${response.status} ${state} (${ms}ms)${detail ? ` | ${detail}` : ''}`);
+    if (API_VERBOSE_LOGS || response.status >= 400) {
+      const ms = Date.now() - startedAt;
+      const state = response.status >= 200 && response.status < 300 ? 'OK' : 'FAIL';
+      console.error(`[API][opensky] ${req.method || 'GET'} ${pathname} -> ${response.status} ${state} (${ms}ms)${detail ? ` | ${detail}` : ''}`);
+    }
     return response;
   };
   const corsHeaders = getCorsHeaders(req, 'GET, OPTIONS');

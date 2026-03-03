@@ -9,6 +9,7 @@ import type {
 import { cachedFetchJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, GROQ_API_URL, GROQ_MODEL, TIER1_COUNTRIES, hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
+import { extractLlmResponseText } from '../../../_shared/llm-content';
 
 // ========================================================================
 // Constants
@@ -93,8 +94,8 @@ Rules:
         });
 
         if (!resp.ok) return null;
-        const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
-        const brief = data.choices?.[0]?.message?.content?.trim() || '';
+        const data = await resp.json() as Record<string, unknown>;
+        const brief = extractLlmResponseText(data).trim();
         if (!brief) return null;
 
         return {

@@ -16,6 +16,7 @@ export const ITS_MTV_AX = 'ITS_MTV_AX';
 export const ITS_MTV_AM = 'ITS_MTV_AM';
 /** Simple average MFN applied tariff — all products. */
 export const TP_A_0010 = 'TP_A_0010';
+let wtoMissingApiKeyLogged = false;
 
 /**
  * WTO member numeric codes → human-readable names.
@@ -52,7 +53,10 @@ export async function wtoFetch(
 ): Promise<any | null> {
   const apiKey = process.env.WTO_API_KEY;
   if (!apiKey) {
-    console.warn('[WTO] WTO_API_KEY not set in process.env');
+    if (!wtoMissingApiKeyLogged) {
+      wtoMissingApiKeyLogged = true;
+      console.error('[WTO] WTO_API_KEY not set in process.env');
+    }
     return null;
   }
 
@@ -75,7 +79,7 @@ export async function wtoFetch(
     // 204 = No Content (valid query, no matching data)
     if (res.status === 204) return { Dataset: [] };
     if (!res.ok) {
-      console.warn(`[WTO] HTTP ${res.status} for ${path}`);
+      console.error(`[WTO] HTTP ${res.status} for ${path}`);
       return null;
     }
     return await res.json();

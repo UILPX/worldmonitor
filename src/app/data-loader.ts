@@ -15,8 +15,13 @@ import {
   REGIONAL_NEWS_FEED_KEYS,
   REGIONAL_NEWS_SELECTION_STORAGE_KEY,
   REGIONAL_NEWS_SELECTION_EVENT,
+  FULL_FINANCE_NEWS_FEED_KEYS,
+  DEFAULT_FULL_FINANCE_NEWS_FEED_KEY,
+  FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY,
+  FULL_FINANCE_NEWS_SELECTION_EVENT,
   inferRegionalNewsFeedFromView,
   type RegionalNewsFeedKey,
+  type FullFinanceNewsFeedKey,
 } from '@/config/feeds';
 import { INTEL_HOTSPOTS, CONFLICT_ZONES } from '@/config/geo';
 import { tokenizeForMatch, matchKeyword } from '@/utils/keyword-match';
@@ -94,7 +99,6 @@ import { classifyWithAI } from '@/services/threat-classifier';
 import { ingestHeadlines } from '@/services/trending-keywords';
 import type { ListFeedDigestResponse } from '@/generated/client/worldmonitor/news/v1/service_client';
 import type { GetSectorSummaryResponse } from '@/generated/client/worldmonitor/market/v1/service_client';
-import { maybeShowDownloadBanner } from '@/components/DownloadBanner';
 import { ResearchServiceClient } from '@/generated/client/worldmonitor/research/v1/service_client';
 import {
   MarketPanel,
@@ -166,6 +170,13 @@ function protoItemToNewsItem(p: ProtoNewsItem): NewsItem {
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
 
+function readPositiveEnvInt(raw: unknown, fallback: number): number {
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
 export interface DataLoaderCallbacks {
   renderCriticalBanner: (postures: TheaterPostureSummary[]) => void;
 }
@@ -183,8 +194,26 @@ export class DataLoaderManager implements AppModule {
   public updateSearchIndex: () => void = () => {};
 
   private digestBreaker = { state: 'closed' as 'closed' | 'open' | 'half-open', failures: 0, cooldownUntil: 0 };
-  private readonly digestRequestTimeoutMs = 8000;
-  private readonly digestBreakerCooldownMs = 5 * 60 * 1000;
+  private readonly digestRequestTimeoutMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_REQUEST_TIMEOUT_MS,
+    30_000,
+  );
+  private readonly digestWarmupRetryTimeoutMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_WARMUP_TIMEOUT_MS,
+    55_000,
+  );
+  private readonly digestRequestRetryDelayMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_RETRY_DELAY_MS,
+    1_500,
+  );
+  private readonly digestBreakerCooldownMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_BREAKER_COOLDOWN_MS,
+    90_000,
+  );
+  private readonly digestBreakerFailureThreshold = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_BREAKER_FAILURES,
+    4,
+  );
   private readonly persistedDigestMaxAgeMs = 6 * 60 * 60 * 1000;
   private readonly perFeedFallbackCategoryFeedLimit = 3;
   private readonly perFeedFallbackIntelFeedLimit = 6;
@@ -194,17 +223,22 @@ export class DataLoaderManager implements AppModule {
   private readonly handleRegionalNewsSelectionChanged = (): void => {
     this.renderSelectedRegionalNews();
   };
+  private readonly handleFullFinanceNewsSelectionChanged = (): void => {
+    this.renderSelectedFullFinanceNews();
+  };
 
   constructor(ctx: AppContext, callbacks: DataLoaderCallbacks) {
     this.ctx = ctx;
     this.callbacks = callbacks;
     window.addEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
+    window.addEventListener(FULL_FINANCE_NEWS_SELECTION_EVENT, this.handleFullFinanceNewsSelectionChanged as EventListener);
   }
 
   init(): void {}
 
   destroy(): void {
     window.removeEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
+    window.removeEventListener(FULL_FINANCE_NEWS_SELECTION_EVENT, this.handleFullFinanceNewsSelectionChanged as EventListener);
     stopOrefPolling();
   }
 
@@ -220,6 +254,18 @@ export class DataLoaderManager implements AppModule {
     return inferRegionalNewsFeedFromView(this.ctx.resolvedLocation);
   }
 
+  private isFullFinanceNewsCategory(category: string): category is FullFinanceNewsFeedKey {
+    return FULL_FINANCE_NEWS_FEED_KEYS.includes(category as FullFinanceNewsFeedKey);
+  }
+
+  private getSelectedFullFinanceNewsCategory(): FullFinanceNewsFeedKey {
+    const stored = localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && FULL_FINANCE_NEWS_FEED_KEYS.includes(stored as FullFinanceNewsFeedKey)) {
+      return stored as FullFinanceNewsFeedKey;
+    }
+    return DEFAULT_FULL_FINANCE_NEWS_FEED_KEY;
+  }
+
   private hasSharedRegionalPanel(category: string): boolean {
     if (!this.isRegionalNewsCategory(category)) return false;
     const panel = this.ctx.newsPanels[category];
@@ -227,44 +273,71 @@ export class DataLoaderManager implements AppModule {
     return REGIONAL_NEWS_FEED_KEYS.some((key) => key !== category && this.ctx.newsPanels[key] === panel);
   }
 
+  private hasSharedFullFinancePanel(category: string): boolean {
+    if (SITE_VARIANT !== 'full') return false;
+    if (!this.isFullFinanceNewsCategory(category)) return false;
+    const panel = this.ctx.newsPanels[category];
+    if (!panel) return false;
+    return FULL_FINANCE_NEWS_FEED_KEYS.some((key) => key !== category && this.ctx.newsPanels[key] === panel);
+  }
+
   private async tryFetchDigest(): Promise<ListFeedDigestResponse | null> {
     const now = Date.now();
+    const cachedDigest = this.lastGoodDigest ?? await this.loadPersistedDigest();
 
     if (this.digestBreaker.state === 'open') {
       if (now < this.digestBreaker.cooldownUntil) {
-        return this.lastGoodDigest ?? await this.loadPersistedDigest();
+        // If no cached digest exists, do not keep the breaker open; try upstream immediately.
+        if (cachedDigest) return cachedDigest;
       }
       this.digestBreaker.state = 'half-open';
     }
 
-    try {
-      const resp = await fetch(
-        `/api/news/v1/list-feed-digest?variant=${SITE_VARIANT}&lang=${getCurrentLanguage()}`,
-        { signal: AbortSignal.timeout(this.digestRequestTimeoutMs) },
-      );
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json() as ListFeedDigestResponse;
-      const catCount = Object.keys(data.categories ?? {}).length;
-      const totalItems = Object.values(data.categories ?? {}).reduce((sum, category) => {
-        return sum + (category?.items?.length ?? 0);
-      }, 0);
-      console.info(`[News] Digest fetched: ${catCount} categories`);
-      // Digest success indicates the live-news source is reachable,
-      // even when zero items are returned in this window.
-      dataFreshness.recordUpdate('rss', totalItems);
-      this.lastGoodDigest = data;
-      this.persistDigest(data);
-      this.digestBreaker = { state: 'closed', failures: 0, cooldownUntil: 0 };
-      return data;
-    } catch (e) {
-      console.warn('[News] Digest fetch failed, using fallback:', e);
-      this.digestBreaker.failures++;
-      if (this.digestBreaker.failures >= 2) {
-        this.digestBreaker.state = 'open';
-        this.digestBreaker.cooldownUntil = now + this.digestBreakerCooldownMs;
+    const timeoutPlan = cachedDigest
+      ? [this.digestRequestTimeoutMs]
+      : [this.digestRequestTimeoutMs, Math.max(this.digestRequestTimeoutMs, this.digestWarmupRetryTimeoutMs)];
+    let lastError: unknown = null;
+
+    for (let i = 0; i < timeoutPlan.length; i++) {
+      try {
+        const timeoutMs = timeoutPlan[i]!;
+        const resp = await fetch(
+          `/api/news/v1/list-feed-digest?variant=${SITE_VARIANT}&lang=${getCurrentLanguage()}`,
+          { signal: AbortSignal.timeout(timeoutMs) },
+        );
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json() as ListFeedDigestResponse;
+        const catCount = Object.keys(data.categories ?? {}).length;
+        const totalItems = Object.values(data.categories ?? {}).reduce((sum, category) => {
+          return sum + (category?.items?.length ?? 0);
+        }, 0);
+
+        if (totalItems <= 0) {
+          throw new Error(`Digest empty (${catCount} categories, ${totalItems} items)`);
+        }
+
+        console.info(`[News] Digest fetched: ${catCount} categories, ${totalItems} items`);
+        dataFreshness.recordUpdate('rss', totalItems);
+        this.lastGoodDigest = data;
+        this.persistDigest(data);
+        this.digestBreaker = { state: 'closed', failures: 0, cooldownUntil: 0 };
+        return data;
+      } catch (e) {
+        lastError = e;
+        const hasNextAttempt = i < timeoutPlan.length - 1;
+        if (hasNextAttempt) {
+          await new Promise((resolve) => setTimeout(resolve, this.digestRequestRetryDelayMs));
+        }
       }
-      return this.lastGoodDigest ?? await this.loadPersistedDigest();
     }
+
+    console.warn('[News] Digest fetch failed, using fallback:', lastError);
+    this.digestBreaker.failures++;
+    if (this.digestBreaker.failures >= this.digestBreakerFailureThreshold) {
+      this.digestBreaker.state = 'open';
+      this.digestBreaker.cooldownUntil = now + this.digestBreakerCooldownMs;
+    }
+    return cachedDigest;
   }
 
   private persistDigest(data: ListFeedDigestResponse): void {
@@ -294,6 +367,21 @@ export class DataLoaderManager implements AppModule {
   private selectLimitedFeeds<T>(feeds: T[], maxFeeds: number): T[] {
     if (feeds.length <= maxFeeds) return feeds;
     return feeds.slice(0, maxFeeds);
+  }
+
+  private reconcileDigestSourceFilter(
+    category: string,
+    digestItems: NewsItem[],
+    filteredItems: NewsItem[],
+    configuredNames: Set<string>,
+  ): NewsItem[] {
+    if (filteredItems.length > 0 || digestItems.length === 0) return filteredItems;
+    const hasConfiguredNameMatch = digestItems.some((item) => configuredNames.has(item.source));
+    if (hasConfiguredNameMatch) return filteredItems;
+    console.warn(
+      `[News] Digest source names drift for "${category}", bypassing source-name filter (${digestItems.length} items)`,
+    );
+    return digestItems;
   }
 
   private shouldShowIntelligenceNotifications(): boolean {
@@ -410,7 +498,7 @@ export class DataLoaderManager implements AppModule {
 
     if (SITE_VARIANT === 'full') {
       tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
-      tasks.push({ name: 'timelineBriefs', task: runGuarded('timelineBriefs', () => this.loadTimelineBriefs()) });
+      tasks.push({ name: 'timeline-briefs', task: runGuarded('timeline-briefs', () => this.loadTimelineBriefs()) });
     }
 
     if (SITE_VARIANT === 'full' && isFeatureAvailable('nasaFirms')) {
@@ -633,6 +721,7 @@ export class DataLoaderManager implements AppModule {
     const panel = this.ctx.newsPanels[category];
     if (!panel) return;
     if (this.hasSharedRegionalPanel(category) && category !== this.getSelectedRegionalNewsCategory()) return;
+    if (this.hasSharedFullFinancePanel(category) && category !== this.getSelectedFullFinanceNewsCategory()) return;
     const filteredItems = this.filterItemsByTimeRange(items);
     if (filteredItems.length === 0 && items.length > 0) {
       panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
@@ -648,6 +737,13 @@ export class DataLoaderManager implements AppModule {
     this.renderNewsForCategory(selectedCategory, items);
   }
 
+  public renderSelectedFullFinanceNews(): void {
+    const selectedCategory = this.getSelectedFullFinanceNewsCategory();
+    if (!(selectedCategory in this.ctx.newsByCategory)) return;
+    const items = this.ctx.newsByCategory[selectedCategory] ?? [];
+    this.renderNewsForCategory(selectedCategory, items);
+  }
+
   applyTimeRangeFilterToNewsPanels(): void {
     Object.entries(this.ctx.newsByCategory).forEach(([category, items]) => {
       this.renderNewsForCategory(category, items);
@@ -656,6 +752,58 @@ export class DataLoaderManager implements AppModule {
 
   applyTimeRangeFilterDebounced(): void {
     this.applyTimeRangeFilterToNewsPanelsDebounced();
+  }
+
+  private includesAnyKeyword(text: string, keywords: readonly string[]): boolean {
+    return keywords.some((keyword) => text.includes(keyword));
+  }
+
+  private bucketFullFinanceNews(items: NewsItem[]): Record<FullFinanceNewsFeedKey, NewsItem[]> {
+    const buckets: Record<FullFinanceNewsFeedKey, NewsItem[]> = {
+      finance: [...items],
+      markets: [],
+      commodities: [],
+      crypto: [],
+      economic: [],
+    };
+
+    const cryptoKeywords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'token', 'blockchain', 'stablecoin', 'defi'];
+    const commoditiesKeywords = ['oil', 'crude', 'brent', 'wti', 'opec', 'gas', 'lng', 'gold', 'silver', 'copper', 'commodity', 'wheat', 'corn', 'soy'];
+    const economicKeywords = ['inflation', 'cpi', 'gdp', 'payroll', 'jobs', 'unemployment', 'fed', 'central bank', 'interest rate', 'rate cut', 'rate hike', 'tariff', 'trade'];
+    const marketsKeywords = ['market', 'stocks', 'equity', 'nasdaq', 'dow', 's&p', 'bond', 'yield', 'forex', 'fx', 'index', 'volatility', 'earnings'];
+
+    for (const item of items) {
+      const text = `${item.title} ${item.source}`.toLowerCase();
+      if (this.includesAnyKeyword(text, cryptoKeywords)) {
+        buckets.crypto.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, commoditiesKeywords)) {
+        buckets.commodities.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, economicKeywords)) {
+        buckets.economic.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, marketsKeywords)) {
+        buckets.markets.push(item);
+        continue;
+      }
+      buckets.markets.push(item);
+    }
+
+    return buckets;
+  }
+
+  private renderNewsWithFullFinanceBuckets(category: string, items: NewsItem[]): void {
+    this.renderNewsForCategory(category, items);
+    if (SITE_VARIANT !== 'full' || category !== 'finance') return;
+    const buckets = this.bucketFullFinanceNews(items);
+    for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+      if (key === 'finance') continue;
+      this.renderNewsForCategory(key, buckets[key]);
+    }
   }
 
   private async loadNewsCategory(category: string, feeds: typeof FEEDS.politics, digest?: ListFeedDigestResponse | null): Promise<NewsItem[]> {
@@ -676,9 +824,11 @@ export class DataLoaderManager implements AppModule {
 
       // Digest branch: server already aggregated feeds — map proto items to client types
       if (digest?.categories && category in digest.categories) {
-        let items = (digest.categories[category]?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledNames.has(i.source));
+        const digestItems = (digest.categories[category]?.items ?? [])
+          .map(protoItemToNewsItem);
+        const configuredNames = new Set((feeds ?? []).map((f) => f.name));
+        let items = digestItems.filter(i => enabledNames.has(i.source));
+        items = this.reconcileDigestSourceFilter(category, digestItems, items, configuredNames);
 
         ingestHeadlines(items.map(i => ({ title: i.title, pubDate: i.pubDate, source: i.source, link: i.link })));
 
@@ -698,7 +848,7 @@ export class DataLoaderManager implements AppModule {
 
         checkBatchForBreakingAlerts(items);
         this.flashMapForNews(items);
-        this.renderNewsForCategory(category, items);
+        this.renderNewsWithFullFinanceBuckets(category, items);
 
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
@@ -719,9 +869,11 @@ export class DataLoaderManager implements AppModule {
       // Digest branch: server already aggregated feeds — map proto items to client types
       if (digest?.categories && category in digest.categories) {
         const enabledNames = new Set(enabledFeeds.map(f => f.name));
-        let items = (digest.categories[category]?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledNames.has(i.source));
+        const digestItems = (digest.categories[category]?.items ?? [])
+          .map(protoItemToNewsItem);
+        const configuredNames = new Set((feeds ?? []).map((f) => f.name));
+        let items = digestItems.filter(i => enabledNames.has(i.source));
+        items = this.reconcileDigestSourceFilter(category, digestItems, items, configuredNames);
 
         ingestHeadlines(items.map(i => ({ title: i.title, pubDate: i.pubDate, source: i.source, link: i.link })));
 
@@ -741,7 +893,7 @@ export class DataLoaderManager implements AppModule {
 
         checkBatchForBreakingAlerts(items);
         this.flashMapForNews(items);
-        this.renderNewsForCategory(category, items);
+        this.renderNewsWithFullFinanceBuckets(category, items);
 
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
@@ -796,7 +948,7 @@ export class DataLoaderManager implements AppModule {
       const staleItems = this.getStaleNewsItems(category).filter(i => enabledNames.has(i.source));
       if (staleItems.length > 0) {
         console.warn(`[News] Digest missing for "${category}", serving stale headlines (${staleItems.length})`);
-        this.renderNewsForCategory(category, staleItems);
+        this.renderNewsWithFullFinanceBuckets(category, staleItems);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
           itemCount: staleItems.length,
@@ -806,7 +958,7 @@ export class DataLoaderManager implements AppModule {
 
       if (!this.isPerFeedFallbackEnabled()) {
         console.warn(`[News] Digest missing for "${category}", limited per-feed fallback disabled`);
-        this.renderNewsForCategory(category, []);
+        this.renderNewsWithFullFinanceBuckets(category, []);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'error',
           errorMessage: 'Digest unavailable',
@@ -830,7 +982,7 @@ export class DataLoaderManager implements AppModule {
         },
       });
 
-      this.renderNewsForCategory(category, items);
+      this.renderNewsWithFullFinanceBuckets(category, items);
       if (panel) {
         if (renderTimeout) {
           clearTimeout(renderTimeout);
@@ -868,6 +1020,11 @@ export class DataLoaderManager implements AppModule {
       });
       this.ctx.statusPanel?.updateApi('RSS2JSON', { status: 'error' });
       delete this.ctx.newsByCategory[category];
+      if (SITE_VARIANT === 'full' && category === 'finance') {
+        for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+          delete this.ctx.newsByCategory[key];
+        }
+      }
       return [];
     }
   }
@@ -926,9 +1083,11 @@ export class DataLoaderManager implements AppModule {
         this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: 0 });
       } else if (digest?.categories && 'intel' in digest.categories) {
         // Digest branch for intel
-        const intel = (digest.categories['intel']?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledIntelNames.has(i.source));
+        const digestIntel = (digest.categories['intel']?.items ?? [])
+          .map(protoItemToNewsItem);
+        let intel = digestIntel.filter(i => enabledIntelNames.has(i.source));
+        const intelConfiguredNames = new Set(enabledIntelSources.map((f) => f.name));
+        intel = this.reconcileDigestSourceFilter('intel', digestIntel, intel, intelConfiguredNames);
         checkBatchForBreakingAlerts(intel);
         this.renderNewsForCategory('intel', intel);
         if (intelPanel) {
@@ -994,7 +1153,6 @@ export class DataLoaderManager implements AppModule {
 
     this.ctx.allNews = collectedNews;
     this.ctx.initialLoadComplete = true;
-    maybeShowDownloadBanner();
     updateAndCheck([
       { type: 'news', region: 'global', count: collectedNews.length },
     ]).then(anomalies => {

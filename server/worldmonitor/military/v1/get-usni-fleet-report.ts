@@ -15,6 +15,7 @@ const USNI_CACHE_KEY = 'usni-fleet:sebuf:v1';
 const USNI_STALE_CACHE_KEY = 'usni-fleet:sebuf:stale:v1';
 const USNI_CACHE_TTL = 21600; // 6 hours
 const USNI_STALE_TTL = 604800; // 7 days
+const USNI_VERBOSE_LOGS = process.env.USNI_VERBOSE_LOGS === 'true';
 
 // ========================================================================
 // USNI parsing helpers
@@ -363,7 +364,9 @@ function parseUSNIArticle(
 // ========================================================================
 
 async function fetchUSNIReport(): Promise<USNIFleetReport | null> {
-  console.log('[USNI Fleet] Fetching from WordPress API...');
+  if (USNI_VERBOSE_LOGS) {
+    console.log('[USNI Fleet] Fetching from WordPress API...');
+  }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
 
@@ -393,9 +396,11 @@ async function fetchUSNIReport(): Promise<USNIFleetReport | null> {
   if (!htmlContent) return null;
 
   const report = parseUSNIArticle(htmlContent, articleUrl, articleDate, articleTitle);
-  console.log(`[USNI Fleet] Parsed: ${report.vessels.length} vessels, ${report.strikeGroups.length} CSGs, ${report.regions.length} regions`);
+  if (USNI_VERBOSE_LOGS) {
+    console.log(`[USNI Fleet] Parsed: ${report.vessels.length} vessels, ${report.strikeGroups.length} CSGs, ${report.regions.length} regions`);
+  }
 
-  if (report.parsingWarnings.length > 0) {
+  if (USNI_VERBOSE_LOGS && report.parsingWarnings.length > 0) {
     console.warn('[USNI Fleet] Warnings:', report.parsingWarnings.join('; '));
   }
 
@@ -423,18 +428,20 @@ export async function getUSNIFleetReport(
       USNI_CACHE_KEY, USNI_CACHE_TTL, fetchUSNIReport,
     );
     if (report) {
-      if (source === 'cache') console.log('[USNI Fleet] Cache hit');
+      if (USNI_VERBOSE_LOGS && source === 'cache') console.log('[USNI Fleet] Cache hit');
       return { report, cached: source === 'cache', stale: false, error: '' };
     }
 
     return { report: undefined, cached: false, stale: false, error: 'No USNI fleet tracker articles found' };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn('[USNI Fleet] Error:', message);
+    console.error('[USNI Fleet] Error:', message);
 
     const stale = (await getCachedJson(USNI_STALE_CACHE_KEY)) as USNIFleetReport | null;
     if (stale) {
-      console.log('[USNI Fleet] Returning stale cached data');
+      if (USNI_VERBOSE_LOGS) {
+        console.log('[USNI Fleet] Returning stale cached data');
+      }
       return { report: stale, cached: true, stale: true, error: 'Using cached data' };
     }
 

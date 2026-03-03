@@ -577,6 +577,13 @@ canvas,
   padding-inline-end: 20px;
 }
 
+.finance-news-select {
+  min-width: 132px;
+  max-width: 176px;
+  font-size: 10px;
+  padding-inline-end: 20px;
+}
+
 .header-center {
   display: flex;
   gap: 8px;
@@ -6513,6 +6520,31 @@ a.prediction-link:hover {
   border-top: 1px solid var(--border);
   font-size: 9px;
   color: var(--text-dim);
+}
+
+.status-panel-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.status-panel-action-btn {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.status-panel-action-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* Export Panel */
@@ -13561,6 +13593,30 @@ a.prediction-link:hover {
 .unified-settings-lang-select:focus {
   outline: none;
   border-color: var(--text-dim);
+}
+
+.unified-settings-action-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.unified-settings-action-btn {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.unified-settings-action-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* Responsive grids */

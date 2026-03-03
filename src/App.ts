@@ -24,7 +24,12 @@ import type { MacroSignalsPanel } from '@/components/MacroSignalsPanel';
 import type { StrategicPosturePanel } from '@/components/StrategicPosturePanel';
 import type { StrategicRiskPanel } from '@/components/StrategicRiskPanel';
 import { isDesktopRuntime } from '@/services/runtime';
-import { isFeatureAvailable, setWebFeatureAvailability, type RuntimeFeatureId } from '@/services/runtime-config';
+import {
+  isFeatureAvailable,
+  setWebFeatureAvailability,
+  type RuntimeFeatureId,
+  RUNTIME_FEATURES,
+} from '@/services/runtime-config';
 import { BETA_MODE } from '@/config/beta';
 import { trackEvent, trackDeeplinkOpened } from '@/services/analytics';
 import { preloadCountryGeometry, getCountryNameByCode } from '@/services/country-geometry';
@@ -51,9 +56,12 @@ type PanelFeatureRequirement = {
 
 const PANEL_FEATURE_REQUIREMENTS: Record<string, PanelFeatureRequirement> = {
   markets: { allOf: ['finnhubMarkets'] },
+  commodities: { allOf: ['finnhubMarkets'] },
+  heatmap: { allOf: ['finnhubMarkets'] },
   economic: { anyOf: ['economicFred', 'energyEia'] },
   'trade-policy': { allOf: ['wtoTrade'] },
   'supply-chain': { allOf: ['supplyChain'] },
+  'satellite-fires': { allOf: ['nasaFirms'] },
 };
 
 export type { CountryBriefSignals } from '@/app/app-context';
@@ -143,6 +151,27 @@ export class App {
           }
         }
         localStorage.setItem(PANEL_ORDER_MIGRATION_KEY, 'done');
+      }
+
+      // One-time migration: move satellite-fires panel to the end for clearer default layout.
+      const FIRES_LAST_MIGRATION_KEY = 'worldmonitor-panel-order-fires-last-v1';
+      if (!localStorage.getItem(FIRES_LAST_MIGRATION_KEY)) {
+        const savedOrder = localStorage.getItem(PANEL_ORDER_KEY);
+        if (savedOrder) {
+          try {
+            const order: string[] = JSON.parse(savedOrder);
+            const firesIdx = order.indexOf('satellite-fires');
+            if (firesIdx !== -1) {
+              order.splice(firesIdx, 1);
+              order.push('satellite-fires');
+              localStorage.setItem(PANEL_ORDER_KEY, JSON.stringify(order));
+              console.log('[App] Migrated panel order: moved satellite-fires to end');
+            }
+          } catch {
+            // Ignore malformed saved order
+          }
+        }
+        localStorage.setItem(FIRES_LAST_MIGRATION_KEY, 'done');
       }
 
       // Tech variant migration: move insights to top (after live-news)
@@ -545,8 +574,37 @@ export class App {
       const panelConfig = this.state.panelSettings[panelId];
       if (!panelConfig) continue;
       if (this.isPanelRequirementSatisfied(requirement)) continue;
+      const previouslyEnabled = panelConfig.enabled !== false;
       panelConfig.enabled = false;
+      const missingFeatures = this.getMissingFeatures(requirement);
+      const missingDetails = missingFeatures.map((featureId) => {
+        const feature = RUNTIME_FEATURES.find((item) => item.id === featureId);
+        const secrets = feature?.requiredSecrets?.join(', ') || 'no secret metadata';
+        return `${featureId} [${secrets}]`;
+      }).join(' | ');
+      const prefix = previouslyEnabled ? 'Auto-hid panel' : 'Panel remains hidden';
+      console.warn(
+        `[App][PanelAutoHide] ${prefix} "${panelId}" due to missing API configuration: ${missingDetails || 'unknown feature requirement'}`,
+      );
     }
+  }
+
+  private getMissingFeatures(requirement: PanelFeatureRequirement): RuntimeFeatureId[] {
+    const required = new Set<RuntimeFeatureId>();
+    if (requirement.allOf) {
+      for (const featureId of requirement.allOf) {
+        if (!isFeatureAvailable(featureId)) required.add(featureId);
+      }
+    }
+    if (requirement.anyOf && requirement.anyOf.length > 0) {
+      const anySatisfied = requirement.anyOf.some((featureId) => isFeatureAvailable(featureId));
+      if (!anySatisfied) {
+        for (const featureId of requirement.anyOf) {
+          required.add(featureId);
+        }
+      }
+    }
+    return [...required];
   }
 
   private isPanelRequirementSatisfied(requirement: PanelFeatureRequirement): boolean {

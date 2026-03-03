@@ -15,11 +15,123 @@ declare const process: { env: Record<string, string | undefined> };
 
 const VALID_VARIANTS = new Set(['full', 'tech', 'finance', 'happy']);
 const fallbackDigestCache = new Map<string, { data: ListFeedDigestResponse; ts: number }>();
+const DIGEST_CACHE_VERSION = 'v2';
+const DIGEST_NEGATIVE_CACHE_TTL_SECONDS = 10;
 const ITEMS_PER_FEED = 5;
 const MAX_ITEMS_PER_CATEGORY = 20;
 const FEED_TIMEOUT_MS = 8_000;
 const OVERALL_DEADLINE_MS = 25_000;
 const BATCH_CONCURRENCY = 20;
+const DIGEST_PROCESS_STARTED_AT = Date.now();
+
+function parsePositiveInt(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function getDigestStartupGraceMs(): number {
+  return parsePositiveInt(process.env.NEWS_DIGEST_STARTUP_GRACE_MS) ?? 6 * 60 * 1000;
+}
+
+function isDigestStartupGracePeriod(): boolean {
+  return (Date.now() - DIGEST_PROCESS_STARTED_AT) < getDigestStartupGraceMs();
+}
+
+function getDigestOverallDeadlineMs(): number {
+  if (!isDigestStartupGracePeriod()) return OVERALL_DEADLINE_MS;
+  return parsePositiveInt(process.env.NEWS_DIGEST_STARTUP_DEADLINE_MS)
+    ?? Math.max(OVERALL_DEADLINE_MS, 45_000);
+}
+
+function getDigestBatchConcurrency(): number {
+  if (!isDigestStartupGracePeriod()) return BATCH_CONCURRENCY;
+  const startupBatch = parsePositiveInt(process.env.NEWS_DIGEST_STARTUP_BATCH_CONCURRENCY);
+  return Math.max(4, Math.min(startupBatch ?? 10, BATCH_CONCURRENCY));
+}
+
+function getFeedTimeoutMs(): number {
+  if (!isDigestStartupGracePeriod()) return FEED_TIMEOUT_MS;
+  return parsePositiveInt(process.env.NEWS_DIGEST_STARTUP_FEED_TIMEOUT_MS)
+    ?? Math.max(FEED_TIMEOUT_MS, 12_000);
+}
+
+function getRelayBaseUrl(): string {
+  const relayUrl = process.env.WS_RELAY_URL || '';
+  if (!relayUrl) return '';
+  return relayUrl.replace('wss://', 'https://').replace('ws://', 'http://').replace(/\/$/, '');
+}
+
+function getRelayHeaders(baseHeaders: Record<string, string>): Record<string, string> {
+  const headers = { ...baseHeaders };
+  const relaySecret = process.env.RELAY_SHARED_SECRET || '';
+  if (relaySecret) {
+    const relayHeader = (process.env.RELAY_AUTH_HEADER || 'x-relay-key').toLowerCase();
+    headers[relayHeader] = relaySecret;
+    headers.Authorization = `Bearer ${relaySecret}`;
+  }
+  return headers;
+}
+
+async function fetchFeedTextOnce(
+  url: string,
+  signal: AbortSignal,
+  timeoutMs: number,
+  headers: Record<string, string>,
+): Promise<Response | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = () => controller.abort();
+  signal.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    return await fetch(url, {
+      headers,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+async function fetchFeedTextWithFallback(
+  feedUrl: string,
+  signal: AbortSignal,
+): Promise<string | null> {
+  const directHeaders = {
+    'User-Agent': CHROME_UA,
+    'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetchFeedTextOnce(feedUrl, signal, getFeedTimeoutMs(), directHeaders);
+      if (resp?.ok) return await resp.text();
+    } catch {
+      // Retry once before fallback.
+    }
+  }
+
+  const relayBase = getRelayBaseUrl();
+  if (!relayBase) return null;
+
+  const relayUrl = `${relayBase}/rss?url=${encodeURIComponent(feedUrl)}`;
+  try {
+    const relayResp = await fetchFeedTextOnce(
+      relayUrl,
+      signal,
+      getFeedTimeoutMs() + 4000,
+      getRelayHeaders(directHeaders),
+    );
+    if (!relayResp?.ok) return null;
+    return await relayResp.text();
+  } catch {
+    return null;
+  }
+}
 
 const LEVEL_TO_PROTO: Record<ThreatLevel, ProtoThreatLevel> = {
   critical: 'THREAT_LEVEL_CRITICAL',
@@ -50,29 +162,9 @@ async function fetchAndParseRss(
 
   try {
     const cached = await cachedFetchJson<ParsedItem[]>(cacheKey, 600, async () => {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
-
-      const onAbort = () => controller.abort();
-      signal.addEventListener('abort', onAbort, { once: true });
-
-      try {
-        const resp = await fetch(feed.url, {
-          headers: {
-            'User-Agent': CHROME_UA,
-            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-          },
-          signal: controller.signal,
-        });
-        if (!resp.ok) return null;
-
-        const text = await resp.text();
-        return parseRssXml(text, feed, variant);
-      } finally {
-        clearTimeout(timeout);
-        signal.removeEventListener('abort', onAbort);
-      }
+      const text = await fetchFeedTextWithFallback(feed.url, signal);
+      if (!text) return null;
+      return parseRssXml(text, feed, variant);
     });
 
     return cached ?? [];
@@ -186,13 +278,20 @@ export async function listFeedDigest(
   const variant = VALID_VARIANTS.has(req.variant) ? req.variant : 'full';
   const lang = req.lang || 'en';
 
-  const digestCacheKey = `news:digest:v1:${variant}:${lang}`;
+  const digestCacheKey = `news:digest:${DIGEST_CACHE_VERSION}:${variant}:${lang}`;
 
   const fallbackKey = `${variant}:${lang}`;
   try {
     const cached = await cachedFetchJson<ListFeedDigestResponse>(digestCacheKey, 900, async () => {
-      return buildDigest(variant, lang);
-    });
+      const built = await buildDigest(variant, lang);
+      const totalItems = Object.values(built.categories ?? {}).reduce((sum, bucket) => {
+        return sum + (bucket?.items?.length ?? 0);
+      }, 0);
+      // Treat fully-empty digest as a miss to avoid poisoning cache for 15 minutes.
+      // This allows quick retries (negative TTL path) and fallback to last-known-good.
+      if (totalItems <= 0) return null;
+      return built;
+    }, DIGEST_NEGATIVE_CACHE_TTL_SECONDS);
     if (cached) {
       if (fallbackDigestCache.size > 50) fallbackDigestCache.clear();
       fallbackDigestCache.set(fallbackKey, { data: cached, ts: Date.now() });
@@ -207,9 +306,10 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
   const feedsByCategory = VARIANT_FEEDS[variant] ?? {};
   const feedStatuses: Record<string, string> = {};
   const categories: Record<string, CategoryBucket> = {};
+  const batchConcurrency = getDigestBatchConcurrency();
 
   const deadlineController = new AbortController();
-  const deadlineTimeout = setTimeout(() => deadlineController.abort(), OVERALL_DEADLINE_MS);
+  const deadlineTimeout = setTimeout(() => deadlineController.abort(), getDigestOverallDeadlineMs());
 
   try {
     const allEntries: Array<{ category: string; feed: ServerFeed }> = [];
@@ -230,10 +330,10 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
 
     const results = new Map<string, ParsedItem[]>();
 
-    for (let i = 0; i < allEntries.length; i += BATCH_CONCURRENCY) {
+    for (let i = 0; i < allEntries.length; i += batchConcurrency) {
       if (deadlineController.signal.aborted) break;
 
-      const batch = allEntries.slice(i, i + BATCH_CONCURRENCY);
+      const batch = allEntries.slice(i, i + batchConcurrency);
       const settled = await Promise.allSettled(
         batch.map(async ({ category, feed }) => {
           const items = await fetchAndParseRss(feed, variant, deadlineController.signal);

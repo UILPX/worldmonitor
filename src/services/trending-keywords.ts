@@ -69,6 +69,7 @@ const BASELINE_REFRESH_MS = HOUR_MS;
 const SPIKE_COOLDOWN_MS = 30 * 60 * 1000;
 const MAX_TRACKED_TERMS = 10000;
 const MAX_AUTO_SUMMARIES_PER_HOUR = 5;
+const MAX_AUTO_SUMMARY_QUEUE_DEPTH = 2;
 const MIN_TOKEN_LENGTH = 3;
 const MIN_SPIKE_SOURCE_COUNT = 2;
 const CONFIG_KEY = 'worldmonitor-trending-config-v1';
@@ -102,6 +103,8 @@ const seenHeadlines = new Map<string, number>();
 const pendingSignals: CorrelationSignal[] = [];
 const activeSpikeTerms = new Set<string>();
 const autoSummaryRuns: number[] = [];
+let autoSummaryPending = 0;
+let autoSummaryChain: Promise<void> = Promise.resolve();
 
 let cachedConfig: TrendingConfig | null = null;
 let lastBaselineRefreshMs = 0;
@@ -442,6 +445,25 @@ function canRunAutoSummary(now: number): boolean {
   return autoSummaryRuns.length < MAX_AUTO_SUMMARIES_PER_HOUR;
 }
 
+function queueAutoSummary(task: () => Promise<string | null>): Promise<string | null> {
+  if (autoSummaryPending >= MAX_AUTO_SUMMARY_QUEUE_DEPTH) {
+    return Promise.resolve(null);
+  }
+
+  autoSummaryPending += 1;
+  const runTask = async (): Promise<string | null> => {
+    try {
+      return await task();
+    } finally {
+      autoSummaryPending = Math.max(0, autoSummaryPending - 1);
+    }
+  };
+
+  const queued = autoSummaryChain.then(runTask, runTask);
+  autoSummaryChain = queued.then(() => undefined, () => undefined);
+  return queued;
+}
+
 function pushSignal(signal: CorrelationSignal): void {
   pendingSignals.push(signal);
   while (pendingSignals.length > 200) {
@@ -525,13 +547,16 @@ async function handleSpike(spike: TrendingSpike, config: TrendingConfig): Promis
     const now = Date.now();
     if (config.autoSummarize && headlines.length >= 2 && canRunAutoSummary(now)) {
       autoSummaryRuns.push(now);
-      const summary = await generateSummary(
-        headlines,
-        undefined,
-        `Breaking: "${spike.term}" mentioned ${spike.count}x in ${windowHours}h (${multiplierText})`
-      );
-      if (summary?.summary) {
-        description = summary.summary;
+      const summaryText = await queueAutoSummary(async () => {
+        const summary = await generateSummary(
+          headlines,
+          undefined,
+          `Breaking: "${spike.term}" mentioned ${spike.count}x in ${windowHours}h (${multiplierText})`
+        );
+        return summary?.summary ?? null;
+      });
+      if (summaryText) {
+        description = summaryText;
       }
     }
 

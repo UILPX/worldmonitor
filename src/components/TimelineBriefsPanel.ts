@@ -1,7 +1,7 @@
 import { Panel } from './Panel';
 import { escapeHtml } from '@/utils/sanitize';
 import { SITE_VARIANT } from '@/config';
-import { t } from '@/services/i18n';
+import { getCurrentLanguage, t } from '@/services/i18n';
 
 type BriefPeriod = '10m' | '1h' | '12h';
 
@@ -31,6 +31,10 @@ export class TimelineBriefsPanel extends Panel {
   private refreshTenMinutesBtn: HTMLButtonElement | null = null;
   private isForceRefreshing = false;
   private latestBriefs: NonNullable<TimelineBriefsPayload['briefs']> | null = null;
+  private inflightFetch: Promise<void> | null = null;
+  private static readonly FIRST_LOAD_TIMEOUT_MS = 160_000;
+  private static readonly REFRESH_TIMEOUT_MS = 120_000;
+  private static readonly FORCE_REFRESH_TIMEOUT_MS = 180_000;
 
   constructor() {
     super({
@@ -73,56 +77,76 @@ export class TimelineBriefsPanel extends Panel {
 
   async fetchData(options: { forceTenMinutes?: boolean } = {}): Promise<void> {
     const forceTenMinutes = options.forceTenMinutes === true;
-    if (!forceTenMinutes || !this.latestBriefs) {
-      this.showLoading();
+    if (this.inflightFetch && !forceTenMinutes) {
+      await this.inflightFetch;
+      return;
     }
-    try {
-      const params = new URLSearchParams({ variant: SITE_VARIANT });
-      if (forceTenMinutes) {
-        params.set('forceTenMinutes', '1');
-        params.set('only', '10m');
-        params.set('_ts', String(Date.now()));
-      }
-      const resp = await fetch(`/api/timeline-briefs?${params.toString()}`, {
-        cache: forceTenMinutes ? 'no-store' : 'default',
-        signal: AbortSignal.timeout(25_000),
-      });
-      if (!resp.ok) {
-        let detail = '';
-        try {
-          const payload = await resp.json() as { details?: string; error?: string };
-          detail = payload.details || payload.error || '';
-        } catch {
-          // ignore parse errors and use status only
-        }
-        throw new Error(detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`);
-      }
 
-      const data = await resp.json() as TimelineBriefsPayload;
-      const briefs = data.briefs;
-      if (!briefs) {
+    const fetchPromise = (async () => {
+      if (!forceTenMinutes || !this.latestBriefs) {
+        this.showLoading();
+      }
+      try {
+        const params = new URLSearchParams({ variant: SITE_VARIANT });
+        params.set('lang', getCurrentLanguage());
+        if (forceTenMinutes) {
+          params.set('forceTenMinutes', '1');
+          params.set('only', '10m');
+          params.set('_ts', String(Date.now()));
+        }
+        const timeoutMs = forceTenMinutes
+          ? TimelineBriefsPanel.FORCE_REFRESH_TIMEOUT_MS
+          : (this.latestBriefs ? TimelineBriefsPanel.REFRESH_TIMEOUT_MS : TimelineBriefsPanel.FIRST_LOAD_TIMEOUT_MS);
+        const resp = await fetch(`/api/timeline-briefs?${params.toString()}`, {
+          cache: forceTenMinutes ? 'no-store' : 'default',
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!resp.ok) {
+          let detail = '';
+          try {
+            const payload = await resp.json() as { details?: string; error?: string };
+            detail = payload.details || payload.error || '';
+          } catch {
+            // ignore parse errors and use status only
+          }
+          throw new Error(detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`);
+        }
+
+        const data = await resp.json() as TimelineBriefsPayload;
+        const briefs = data.briefs;
+        if (!briefs) {
+          this.setDataBadge('unavailable');
+          if (!this.latestBriefs) {
+            this.showError(t('components.timelineBriefs.unavailable'));
+          }
+          return;
+        }
+
+        const merged: NonNullable<TimelineBriefsPayload['briefs']> = {
+          tenMinutes: briefs.tenMinutes ?? this.latestBriefs?.tenMinutes,
+          oneHour: briefs.oneHour ?? this.latestBriefs?.oneHour,
+          twelveHours: briefs.twelveHours ?? this.latestBriefs?.twelveHours,
+        };
+        this.latestBriefs = merged;
+        this.setDataBadge('live');
+        this.setContent(this.renderBriefs(merged));
+      } catch (error) {
+        console.error('[TimelineBriefsPanel] fetchData failed:', error);
         this.setDataBadge('unavailable');
         if (!this.latestBriefs) {
           this.showError(t('components.timelineBriefs.unavailable'));
         }
-        return;
       }
+    })();
 
-      const merged: NonNullable<TimelineBriefsPayload['briefs']> = {
-        tenMinutes: briefs.tenMinutes ?? this.latestBriefs?.tenMinutes,
-        oneHour: briefs.oneHour ?? this.latestBriefs?.oneHour,
-        twelveHours: briefs.twelveHours ?? this.latestBriefs?.twelveHours,
-      };
-      this.latestBriefs = merged;
-      this.setDataBadge('live');
-      this.setContent(this.renderBriefs(merged));
-    } catch (error) {
-      console.error('[TimelineBriefsPanel] fetchData failed:', error);
-      this.setDataBadge('unavailable');
-      if (!this.latestBriefs) {
-        this.showError(t('components.timelineBriefs.unavailable'));
+    let trackedPromise!: Promise<void>;
+    trackedPromise = fetchPromise.finally(() => {
+      if (this.inflightFetch === trackedPromise) {
+        this.inflightFetch = null;
       }
-    }
+    });
+    this.inflightFetch = trackedPromise;
+    await trackedPromise;
   }
 
   private formatLocal(ts: number): string {

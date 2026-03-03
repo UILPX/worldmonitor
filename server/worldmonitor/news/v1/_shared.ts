@@ -73,6 +73,7 @@ export function buildArticlePrompts(
   const isTechVariant = opts.variant === 'tech';
   const dateContext = `Current date: ${new Date().toISOString().split('T')[0]}.${isTechVariant ? '' : ' Provide geopolitical context appropriate for the current date.'}`;
   const langInstruction = buildLanguageInstruction(opts.lang);
+  const noThinkingRule = '\n- Output only the final answer. Do not output thinking steps, reasoning process, or prompt analysis.';
 
   let systemPrompt: string;
   let userPrompt: string;
@@ -89,7 +90,7 @@ Rules:
 - Focus ONLY on technology, startups, AI, funding, product launches, or developer news
 - IGNORE political news, trade policy, tariffs, government actions unless directly about tech regulation
 - Lead with the company/product/technology name
-- No bullet points, no meta-commentary, no elaboration beyond the core facts${langInstruction}`;
+- No bullet points, no meta-commentary, no elaboration beyond the core facts${langInstruction}${noThinkingRule}`;
     } else {
       systemPrompt = `${dateContext}
 
@@ -102,7 +103,7 @@ Rules:
 - NEVER start with "Breaking news", "Good evening", "Tonight", or TV-style openings
 - Start directly with the subject of the chosen headline
 - If intelligence context is provided, use it only if it relates to your chosen headline
-- No bullet points, no meta-commentary, no elaboration beyond the core facts${langInstruction}`;
+- No bullet points, no meta-commentary, no elaboration beyond the core facts${langInstruction}${noThinkingRule}`;
     }
     userPrompt = `Each headline below is a separate story. Pick the most important ONE and summarize only that story:\n${headlineText}${intelSection}`;
   } else if (opts.mode === 'analysis') {
@@ -116,7 +117,7 @@ Rules:
 - NEVER combine facts from different headlines
 - Focus ONLY on technology implications: funding trends, AI developments, market shifts, product strategy
 - IGNORE political implications, trade wars, government unless directly about tech policy
-- Lead with the insight, no filler or elaboration`;
+- Lead with the insight, no filler or elaboration${noThinkingRule}`;
     } else {
       systemPrompt = `${dateContext}
 
@@ -128,7 +129,7 @@ Rules:
 - Lead with the insight - what's significant and why
 - NEVER start with "Breaking news", "Tonight", "The key/dominant narrative is"
 - Start with substance, no filler or elaboration
-- If intelligence context is provided, use it only if it relates to your chosen headline`;
+- If intelligence context is provided, use it only if it relates to your chosen headline${noThinkingRule}`;
     }
     userPrompt = isTechVariant
       ? `Each headline is a separate story. What's the key tech trend?\n${headlineText}${intelSection}`
@@ -143,12 +144,13 @@ Rules:
 - Maintain the original tone and journalistic style.
 - Do NOT add any conversational filler (e.g., "Here is the translation").
 - Output ONLY the translated text.
-- If the text is already in ${targetLang}, return it as is.${chineseTargetRule}`;
+- If the text is already in ${targetLang}, return it as is.${chineseTargetRule}
+- Output only the translated result. Do not output thinking steps or prompt analysis.`;
     userPrompt = `Translate to ${targetLang}:\n${headlines[0]}`;
   } else {
     systemPrompt = isTechVariant
-      ? `${dateContext}\n\nPick the most important tech headline and summarize it in 2 concise sentences (under 60 words). Each headline is a separate story - NEVER merge facts from different headlines. Focus on startups, AI, funding, products. Ignore politics unless directly about tech regulation.${langInstruction}`
-      : `${dateContext}\n\nPick the most important headline and summarize it in 2 concise sentences (under 60 words). Each headline is a separate, unrelated story - NEVER merge people or facts from different headlines. Lead with substance. NEVER start with "Breaking news" or "Tonight".${langInstruction}`;
+      ? `${dateContext}\n\nPick the most important tech headline and summarize it in 2 concise sentences (under 60 words). Each headline is a separate story - NEVER merge facts from different headlines. Focus on startups, AI, funding, products. Ignore politics unless directly about tech regulation.${langInstruction}${noThinkingRule}`
+      : `${dateContext}\n\nPick the most important headline and summarize it in 2 concise sentences (under 60 words). Each headline is a separate, unrelated story - NEVER merge people or facts from different headlines. Lead with substance. NEVER start with "Breaking news" or "Tonight".${langInstruction}${noThinkingRule}`;
     userPrompt = `Each headline is a separate story. Key takeaway from the most important one:\n${headlineText}${intelSection}`;
   }
 
@@ -166,6 +168,16 @@ export interface ProviderCredentials {
   extraBody?: Record<string, unknown>;
 }
 
+function envEnabled(name: string): boolean {
+  const raw = process.env[name];
+  if (!raw) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+const OPENAI_PROVIDER_DISABLED = envEnabled('LLM_DISABLE_OPENAI')
+  || envEnabled('DISABLE_OPENAI')
+  || envEnabled('OPENAI_DISABLED');
+
 export function getProviderCredentials(provider: string): ProviderCredentials | null {
   if (provider === 'ollama') {
     const baseUrl = process.env.OLLAMA_API_URL;
@@ -175,13 +187,22 @@ export function getProviderCredentials(provider: string): ProviderCredentials | 
     if (apiKey) {
       headers['Authorization'] = `Bearer ${apiKey}`;
     }
-    const rawMax = parseInt(process.env.OLLAMA_MAX_TOKENS || '300', 10);
-    const ollamaMaxTokens = Number.isFinite(rawMax) ? Math.min(Math.max(rawMax, 50), 2000) : 300;
+    const rawForceMax = process.env.SUMMARIZE_OLLAMA_FORCE_MAX_TOKENS
+      || process.env.OLLAMA_FORCE_MAX_TOKENS
+      || '';
+    const parsedForceMax = Number.parseInt(rawForceMax, 10);
+    const forceMaxTokens = Number.isFinite(parsedForceMax)
+      ? Math.min(Math.max(parsedForceMax, 50), 4000)
+      : 0;
+    const extraBody: Record<string, unknown> = { think: false };
+    if (forceMaxTokens > 0) {
+      extraBody.max_tokens = forceMaxTokens;
+    }
     return {
       apiUrl: new URL('/v1/chat/completions', baseUrl).toString(),
       model: process.env.OLLAMA_MODEL || 'llama3.1:8b',
       headers,
-      extraBody: { think: false, max_tokens: ollamaMaxTokens },
+      extraBody,
     };
   }
 
@@ -199,6 +220,7 @@ export function getProviderCredentials(provider: string): ProviderCredentials | 
   }
 
   if (provider === 'openai') {
+    if (OPENAI_PROVIDER_DISABLED) return null;
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return null;
     return {

@@ -4,6 +4,7 @@
 import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 
 export const config = { runtime: 'edge' };
+const API_VERBOSE_LOGS = process.env.API_VERBOSE_LOGS === 'true';
 
 async function fetchWithTimeout(url, options, timeoutMs = 25000) {
   const controller = new AbortController();
@@ -21,9 +22,11 @@ export default async function handler(req) {
     try { return new URL(req.url).pathname; } catch { return '/api/telegram-feed'; }
   })();
   const finish = (response, detail = '') => {
-    const ms = Date.now() - startedAt;
-    const state = response.status >= 200 && response.status < 300 ? 'OK' : 'FAIL';
-    console.info(`[API][telegram-feed] ${req.method || 'GET'} ${pathname} -> ${response.status} ${state} (${ms}ms)${detail ? ` | ${detail}` : ''}`);
+    if (API_VERBOSE_LOGS || response.status >= 400) {
+      const ms = Date.now() - startedAt;
+      const state = response.status >= 200 && response.status < 300 ? 'OK' : 'FAIL';
+      console.error(`[API][telegram-feed] ${req.method || 'GET'} ${pathname} -> ${response.status} ${state} (${ms}ms)${detail ? ` | ${detail}` : ''}`);
+    }
     return response;
   };
   const cors = getCorsHeaders(req, 'GET, OPTIONS');

@@ -4,9 +4,12 @@ import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 import { validateApiKey } from './_api-key.js';
 // @ts-expect-error — JS module, no declaration file
 import { checkRateLimit } from './_rate-limit.js';
-import { cachedFetchJson, cachedFetchJsonWithMeta } from '../server/_shared/redis';
+import { cachedFetchJson, cachedFetchJsonWithMeta, getCachedJson } from '../server/_shared/redis';
 import { CHROME_UA } from '../server/_shared/constants';
-import { logLocalLlmRequest } from '../server/_shared/local-llm-log';
+import { logLocalLlmFailure, logLocalLlmRequest } from '../server/_shared/local-llm-log';
+import { runWithLocalLlmQueue } from '../server/_shared/local-llm-queue';
+import { extractFinalAnswerFromReasoning, extractLlmResponseText } from '../server/_shared/llm-content';
+import { buildApiBaseOrigins } from './_internal-api-origin';
 
 export const config = { runtime: 'edge' };
 
@@ -76,6 +79,7 @@ const MAX_QUESTION_CHARS = 240;
 const MIN_QUESTION_CHARS = 3;
 const MAX_CONTEXT_HEADLINES = 50;
 const MAX_CONTEXT_CHARS = 6000;
+const DIGEST_CACHE_VERSION = 'v2';
 
 function readPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -84,16 +88,43 @@ function readPositiveInt(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
+function envEnabled(name: string): boolean {
+  const raw = process.env[name];
+  if (!raw) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+const OPENAI_PROVIDER_DISABLED = envEnabled('LLM_DISABLE_OPENAI')
+  || envEnabled('DISABLE_OPENAI')
+  || envEnabled('OPENAI_DISABLED');
+
 const GLOBAL_LIMIT = readPositiveInt('RECENT_QA_GLOBAL_LIMIT', 180);
 const GLOBAL_WINDOW_SECONDS = readPositiveInt('RECENT_QA_GLOBAL_WINDOW_SECONDS', 600);
 const VISITOR_LIMIT = readPositiveInt('RECENT_QA_VISITOR_LIMIT', 8);
 const VISITOR_WINDOW_SECONDS = readPositiveInt('RECENT_QA_VISITOR_WINDOW_SECONDS', 600);
 
-function getProviderTimeoutMs(provider: ProviderConfig['id']): number {
+function getProviderTimeoutMs(provider: ProviderConfig['id'], contextChars = 0): number {
   if (provider === 'ollama') {
-    return readPositiveInt('OLLAMA_TIMEOUT_MS', 120_000);
+    const base = readPositiveInt('OLLAMA_TIMEOUT_MS', 120_000);
+    const dynamicExtra = Math.min(90_000, Math.max(0, Math.floor(contextChars * 8)));
+    return Math.min(readPositiveInt('RECENT_QA_OLLAMA_TIMEOUT_MAX_MS', 300_000), base + dynamicExtra);
   }
   return readPositiveInt('LLM_UPSTREAM_TIMEOUT_MS', 30_000);
+}
+
+function getCompletionLimit(provider: ProviderConfig['id'], model: string): number {
+  if (provider === 'ollama') {
+    return readPositiveInt('RECENT_QA_OLLAMA_FORCE_MAX_TOKENS',
+      readPositiveInt('OLLAMA_FORCE_MAX_TOKENS', 0));
+  }
+  if (usesMaxCompletionTokens(provider, model)) {
+    return readPositiveInt('RECENT_QA_OPENAI_MAX_COMPLETION_TOKENS', 260);
+  }
+  return readPositiveInt('RECENT_QA_MAX_TOKENS', 260);
+}
+
+function getRecentQaDigestFetchTimeoutMs(): number {
+  return readPositiveInt('RECENT_QA_DIGEST_FETCH_TIMEOUT_MS', 35_000);
 }
 
 function usesMaxCompletionTokens(provider: ProviderConfig['id'], model: string): boolean {
@@ -118,23 +149,53 @@ function usesDefaultSamplingOnly(provider: ProviderConfig['id'], model: string):
   );
 }
 
+function hasMinimumChinese(text: string, minCount: number): boolean {
+  const cjk = text.match(/[\u4e00-\u9fff]/g)?.length ?? 0;
+  return cjk >= minCount;
+}
+
 function normalizeVariant(value: string | null): Variant {
   if (value && VALID_VARIANTS.has(value as Variant)) return value as Variant;
   return 'full';
 }
 
+function extractPrimaryLanguage(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw.split(',')[0]?.split(';')[0]?.trim() || '';
+}
+
+function normalizeOutputLanguage(raw: string | null | undefined): string {
+  const primary = extractPrimaryLanguage(raw);
+  if (!primary) return 'en';
+  const lowered = primary.toLowerCase();
+  if (lowered === 'zh' || lowered.startsWith('zh-')) return 'zh-CN';
+  return primary;
+}
+
+function isChineseLanguage(lang: string): boolean {
+  const lowered = (lang || '').toLowerCase();
+  return lowered === 'zh' || lowered.startsWith('zh-');
+}
+
+function toLanguageCacheKey(lang: string): string {
+  return (lang || 'en').toLowerCase().replace(/[^a-z0-9-]+/g, '_');
+}
+
+function getOllamaNoThinkPrefix(): string {
+  return '/set nothink\n';
+}
+
+function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
+  return [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: getOllamaNoThinkPrefix().trim() },
+    { role: 'user', content: userPrompt },
+  ];
+}
+
 function normalizeQuestion(value: unknown): string {
   const text = typeof value === 'string' ? value : '';
   return text.trim().slice(0, MAX_QUESTION_CHARS);
-}
-
-function extractOriginFromReferer(referer: string | null): string {
-  if (!referer) return '';
-  try {
-    return new URL(referer).origin;
-  } catch {
-    return '';
-  }
 }
 
 function getClientIp(req: Request): string {
@@ -180,7 +241,7 @@ function getProviders(): ProviderConfig[] {
     });
   }
 
-  if (process.env.OPENAI_API_KEY) {
+  if (process.env.OPENAI_API_KEY && !OPENAI_PROVIDER_DISABLED) {
     providers.push({
       id: 'openai',
       apiUrl: 'https://api.openai.com/v1/chat/completions',
@@ -221,19 +282,61 @@ function getProviders(): ProviderConfig[] {
   return providers;
 }
 
-async function fetchDigest(origin: string, variant: Variant): Promise<DigestPayload> {
-  const url = `${origin}/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': CHROME_UA,
-      Referer: `${origin}/`,
-    },
-    signal: AbortSignal.timeout(20_000),
+async function fetchDigest(origins: string[], variant: Variant): Promise<DigestPayload> {
+  const cached = await getCachedJson(`news:digest:${DIGEST_CACHE_VERSION}:${variant}:en`);
+  if (cached && typeof cached === 'object' && !Array.isArray(cached)) {
+    return cached as DigestPayload;
+  }
+
+  const attempts: string[] = [];
+  const dedupedOrigins = [...new Set(origins.filter(Boolean))];
+  const timeoutMs = getRecentQaDigestFetchTimeoutMs();
+
+  const requests = dedupedOrigins.map(async (origin) => {
+    const url = `${origin}/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': CHROME_UA,
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return (await resp.json()) as DigestPayload;
+    } catch (error) {
+      attempts.push(`${origin}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
   });
-  if (!resp.ok) throw new Error(`Digest error: HTTP ${resp.status}`);
-  return (await resp.json()) as DigestPayload;
+
+  if (requests.length === 0) {
+    throw new Error('Digest fetch failed (no candidate origins)');
+  }
+
+  try {
+    const fastest = await new Promise<DigestPayload>((resolve, reject) => {
+      let failures = 0;
+      for (const req of requests) {
+        req.then(resolve).catch(() => {
+          failures += 1;
+          if (failures >= requests.length) {
+            reject(new Error('all digest origins failed'));
+          }
+        });
+      }
+    });
+    return fastest;
+  } catch {
+    const fallback = await getCachedJson(`news:digest:${DIGEST_CACHE_VERSION}:${variant}:en`);
+    if (fallback && typeof fallback === 'object' && !Array.isArray(fallback)) {
+      return fallback as DigestPayload;
+    }
+    throw new Error(`Digest fetch failed (${attempts.join(' | ')})`);
+  }
 }
 
 function collectRecentHeadlines(digest: DigestPayload, nowMs: number): RecentHeadline[] {
@@ -330,15 +433,24 @@ function buildContext(question: string, headlines: RecentHeadline[]): ContextBui
   };
 }
 
-function buildPrompts(question: string, context: ContextBuildResult): { system: string; user: string } {
+function buildPrompts(
+  question: string,
+  context: ContextBuildResult,
+  outputLang: string,
+): { system: string; user: string } {
+  const languageRule = isChineseLanguage(outputLang)
+    ? '- Always answer in Simplified Chinese (简体中文, zh-CN).\n- Never use Traditional Chinese characters.'
+    : outputLang.toLowerCase().startsWith('en')
+      ? '- Always answer in English.'
+      : `- Always answer in ${outputLang}.`;
   const system = `You answer user questions about recent events using ONLY the provided headlines.
 Rules:
 - Do not invent facts.
 - If evidence is insufficient, explicitly say so.
 - Keep answer under 120 words.
 - Use plain text only (no markdown table, no code block).
-- Always answer in Simplified Chinese (简体中文, zh-CN).
-- Never use Traditional Chinese characters.`;
+- Output only the final answer. Do not output thinking steps, reasoning process, or prompt analysis.
+${languageRule}`;
   const user = `Question:
 ${question}
 
@@ -351,54 +463,102 @@ ${context.lines.join('\n')}
 async function askWithProviders(
   question: string,
   context: ContextBuildResult,
+  outputLang: string,
 ): Promise<{ answer: string; provider: string; model: string }> {
   const providers = getProviders();
   if (providers.length === 0) {
     throw new Error('No AI provider configured');
   }
 
-  const prompts = buildPrompts(question, context);
+  const prompts = buildPrompts(question, context, outputLang);
   let lastError = 'Unknown AI error';
 
   for (const provider of providers) {
     try {
-      const completionLimit = 260;
-      const body = {
-        model: provider.model,
-        messages: [
-          { role: 'system', content: prompts.system },
-          { role: 'user', content: prompts.user },
-        ],
-        ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
-        ...(usesMaxCompletionTokens(provider.id, provider.model)
-          ? { max_completion_tokens: completionLimit }
-          : { max_tokens: completionLimit }),
-        ...(provider.extraBody || {}),
+      const invokeProvider = async (): Promise<{ answer: string; provider: string; model: string }> => {
+        const completionLimit = getCompletionLimit(provider.id, provider.model);
+        const buildBody = () => {
+          return {
+            model: provider.model,
+            messages: provider.id === 'ollama'
+              ? buildOllamaChatMessages(prompts.system, prompts.user)
+              : [
+                { role: 'system', content: prompts.system },
+                { role: 'user', content: prompts.user },
+              ],
+            ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
+            ...(completionLimit > 0
+              ? (usesMaxCompletionTokens(provider.id, provider.model)
+                ? { max_completion_tokens: completionLimit }
+                : { max_tokens: completionLimit })
+              : {}),
+            ...(provider.extraBody || {}),
+          };
+        };
+
+        const call = async (
+          body: Record<string, unknown>,
+          scope: 'recent-events-qa' | 'recent-events-qa-retry',
+        ): Promise<Record<string, unknown>> => {
+          logLocalLlmRequest(scope, provider.id, provider.apiUrl, provider.model);
+          const resp = await fetch(provider.apiUrl, {
+            method: 'POST',
+            headers: { ...provider.headers, 'User-Agent': CHROME_UA },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(getProviderTimeoutMs(provider.id, context.contextChars)),
+          });
+
+          if (!resp.ok) {
+            const errorText = (await resp.text()).replace(/\s+/g, ' ').trim().slice(0, 240);
+            throw new Error(`${provider.id} HTTP ${resp.status}${errorText ? `: ${errorText}` : ''}`);
+          }
+
+          return await resp.json() as Record<string, unknown>;
+        };
+
+        let data = await call(buildBody(), 'recent-events-qa');
+        let answer = extractLlmResponseText(data).trim();
+        if (!answer) {
+          answer = extractFinalAnswerFromReasoning(data).trim();
+        }
+        if (!answer && provider.id === 'ollama') {
+          data = await call(buildBody(), 'recent-events-qa-retry');
+          answer = extractLlmResponseText(data).trim();
+          if (!answer) {
+            answer = extractFinalAnswerFromReasoning(data).trim();
+          }
+        }
+        if (!answer) {
+          logLocalLlmFailure('recent-events-qa', provider.id, provider.model, 'empty_response', data, {
+            questionLen: question.length,
+            headlineCount: context.headlineCount,
+            contextChars: context.contextChars,
+          });
+          throw new Error(`${provider.id} empty response`);
+        }
+        if (isChineseLanguage(outputLang) && !hasMinimumChinese(answer, 2)) {
+          logLocalLlmFailure('recent-events-qa', provider.id, provider.model, 'non_chinese_output', data, {
+            questionLen: question.length,
+            headlineCount: context.headlineCount,
+            contextChars: context.contextChars,
+            answerLen: answer.length,
+            lang: outputLang,
+          });
+          throw new Error(`${provider.id} non-Chinese response`);
+        }
+        return { answer, provider: provider.id, model: provider.model };
       };
 
-      logLocalLlmRequest('recent-events-qa', provider.id, provider.apiUrl, provider.model);
-      const resp = await fetch(provider.apiUrl, {
-        method: 'POST',
-        headers: { ...provider.headers, 'User-Agent': CHROME_UA },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(getProviderTimeoutMs(provider.id)),
-      });
-
-      if (!resp.ok) {
-        lastError = `${provider.id} HTTP ${resp.status}`;
-        continue;
+      if (provider.id === 'ollama') {
+        return await runWithLocalLlmQueue('recent-events-qa', invokeProvider);
       }
-
-      const data = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const answer = String(data?.choices?.[0]?.message?.content || '').trim();
-      if (!answer) {
-        lastError = `${provider.id} empty response`;
-        continue;
-      }
-
-      return { answer, provider: provider.id, model: provider.model };
+      return await invokeProvider();
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      logLocalLlmFailure('recent-events-qa', provider.id, provider.model, 'request_error', undefined, {
+        error: message.slice(0, 180),
+      });
+      lastError = message;
     }
   }
 
@@ -498,18 +658,25 @@ async function enforceQaRateLimits(req: Request, variant: Variant): Promise<Resp
   return null;
 }
 
-async function getRecentHeadlineCache(origin: string, variant: Variant): Promise<RecentHeadline[]> {
+async function getRecentHeadlineCache(origins: string[], variant: Variant): Promise<RecentHeadline[]> {
   const key = `recent-events-qa:headlines:v1:${variant}`;
   const cached = await cachedFetchJson<RecentHeadline[]>(
     key,
     CONTEXT_CACHE_TTL_SECONDS,
     async () => {
-      const digest = await fetchDigest(origin, variant);
+      const digest = await fetchDigest(origins, variant);
       return collectRecentHeadlines(digest, Date.now());
     },
     NEGATIVE_TTL_SECONDS,
   );
   return cached ?? [];
+}
+
+function getNoRecentCacheMessage(outputLang: string): string {
+  if (isChineseLanguage(outputLang)) {
+    return '当前暂无可用的近期事件缓存，请几分钟后再试。';
+  }
+  return 'No recent-event cache is available yet. Please try again in a few minutes.';
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -546,7 +713,7 @@ export default async function handler(req: Request): Promise<Response> {
 
   try {
     const requestUrl = new URL(req.url);
-    const body = await req.json().catch(() => ({})) as { question?: unknown; variant?: string };
+    const body = await req.json().catch(() => ({})) as { question?: unknown; variant?: string; lang?: string };
     const question = normalizeQuestion(body?.question);
     if (question.length < MIN_QUESTION_CHARS) {
       return new Response(JSON.stringify({
@@ -561,6 +728,12 @@ export default async function handler(req: Request): Promise<Response> {
       requestUrl.searchParams.get('variant')
       || (typeof body?.variant === 'string' ? body.variant : null),
     );
+    const outputLang = normalizeOutputLanguage(
+      requestUrl.searchParams.get('lang')
+      || (typeof body?.lang === 'string' ? body.lang : null)
+      || req.headers.get('x-user-lang')
+      || req.headers.get('accept-language'),
+    );
 
     const customRateLimit = await enforceQaRateLimits(req, variant);
     if (customRateLimit) {
@@ -571,21 +744,22 @@ export default async function handler(req: Request): Promise<Response> {
       });
     }
 
-    const origin = requestUrl.origin || extractOriginFromReferer(req.headers.get('referer')) || '';
+    const origins = buildApiBaseOrigins(req);
     const now = Date.now();
     const slot = Math.floor(now / (5 * 60 * 1000));
     const qHash = hashText(question.toLowerCase());
-    const cacheKey = `recent-events-qa:answer:v1:${variant}:${slot}:${qHash}`;
+    const cacheLang = toLanguageCacheKey(outputLang);
+    const cacheKey = `recent-events-qa:answer:v1:${variant}:${cacheLang}:${slot}:${qHash}`;
 
     const { data: payload, source } = await cachedFetchJsonWithMeta<QAPayload>(
       cacheKey,
       ANSWER_CACHE_TTL_SECONDS,
       async () => {
-        const headlines = await getRecentHeadlineCache(origin, variant);
+        const headlines = await getRecentHeadlineCache(origins, variant);
         if (headlines.length === 0) {
           return {
             question,
-            answer: '当前暂无可用的近期事件缓存，请几分钟后再试。',
+            answer: getNoRecentCacheMessage(outputLang),
             provider: 'none',
             model: '',
             generatedAt: Date.now(),
@@ -598,7 +772,7 @@ export default async function handler(req: Request): Promise<Response> {
         }
 
         const context = buildContext(question, headlines);
-        const result = await askWithProviders(question, context);
+        const result = await askWithProviders(question, context, outputLang);
         return {
           question,
           answer: result.answer,

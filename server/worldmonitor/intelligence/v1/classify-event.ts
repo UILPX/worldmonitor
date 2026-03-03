@@ -10,6 +10,7 @@ import type {
 import { cachedFetchJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, GROQ_API_URL, GROQ_MODEL, hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
+import { extractLlmResponseText } from '../../../_shared/llm-content';
 
 // ========================================================================
 // Constants
@@ -83,8 +84,8 @@ Return: {"level":"...","category":"..."}`;
           });
 
           if (!resp.ok) return null;
-          const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
-          const raw = data.choices?.[0]?.message?.content?.trim();
+          const data = await resp.json() as Record<string, unknown>;
+          const raw = extractLlmResponseText(data).trim();
           if (!raw) return null;
 
           let parsed: { level?: string; category?: string };

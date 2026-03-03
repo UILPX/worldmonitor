@@ -27,6 +27,7 @@ export class TelegramIntelPanel extends Panel {
       trackActivity: true,
       infoTooltip: t('components.telegramIntel.infoTooltip'),
     });
+    this.element.classList.add('panel-default-span-2');
     this.createTabs();
     this.createSummarizeButton();
     this.showLoading(t('components.telegramIntel.loading'));

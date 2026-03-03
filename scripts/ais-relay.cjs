@@ -24,9 +24,28 @@ const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 
-// Log effective heap limit at startup (verifies NODE_OPTIONS=--max-old-space-size is active)
+const relayConsole = {
+  log: console.log.bind(console),
+  info: console.info.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+const RELAY_LOG_MODE = String(process.env.RELAY_LOG_MODE || process.env.RELAY_LOG_LEVEL || 'errors').trim().toLowerCase();
+const RELAY_ERRORS_ONLY_LOGGING = RELAY_LOG_MODE === 'error'
+  || RELAY_LOG_MODE === 'errors'
+  || RELAY_LOG_MODE === 'quiet';
+
+if (RELAY_ERRORS_ONLY_LOGGING) {
+  console.log = () => {};
+  console.info = () => {};
+  console.warn = () => {};
+}
+
+// Log effective heap limit when non-error logging is enabled.
 const _heapStats = v8.getHeapStatistics();
-console.log(`[Relay] Heap limit: ${(_heapStats.heap_size_limit / 1024 / 1024).toFixed(0)}MB`);
+if (!RELAY_ERRORS_ONLY_LOGGING) {
+  console.log(`[Relay] Heap limit: ${(_heapStats.heap_size_limit / 1024 / 1024).toFixed(0)}MB`);
+}
 
 const AISSTREAM_URL = 'wss://stream.aisstream.io/v0/stream';
 const API_KEY = process.env.AISSTREAM_API_KEY || process.env.VITE_AISSTREAM_API_KEY;
@@ -86,6 +105,137 @@ const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTT
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 const RELAY_VERBOSE_HTTP = process.env.RELAY_VERBOSE_HTTP === 'true'
   || (!IS_PRODUCTION_RELAY && process.env.RELAY_VERBOSE_HTTP !== 'false');
+
+function parseCsvList(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function normalizeDomainInput(raw) {
+  if (!raw) return '';
+  const input = String(raw).trim().toLowerCase();
+  if (!input) return '';
+  try {
+    if (input.includes('://')) {
+      return new URL(input).hostname.toLowerCase();
+    }
+    return input.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function isPrivateIpv4(hostname) {
+  const parts = hostname.split('.').map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) return false;
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  return false;
+}
+
+function isUnsafeRssHost(hostname) {
+  const host = String(hostname || '').trim().toLowerCase();
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.local')) return true;
+  if (host === '::1' || host === '[::1]') return true;
+  if (isPrivateIpv4(host)) return true;
+  return false;
+}
+
+function extractDomainsFromFile(filePath) {
+  if (!existsSync(filePath)) return [];
+  let content = '';
+  try {
+    content = readFileSync(filePath, 'utf8');
+  } catch {
+    return [];
+  }
+  const found = new Set();
+  const matches = content.match(/https?:\/\/[^\s"'`)}]+/gi) || [];
+  for (const rawUrl of matches) {
+    const cleaned = rawUrl.replace(/[),.;]+$/, '');
+    try {
+      const parsed = new URL(cleaned);
+      if (parsed.hostname) found.add(parsed.hostname.toLowerCase());
+    } catch {
+      // ignore invalid URLs
+    }
+  }
+  return [...found];
+}
+
+function buildRelayRssAllowedDomains() {
+  const domainSet = new Set();
+
+  // Baseline domains (compatibility with older RSS proxy behaviour).
+  [
+    'rss.cnn.com',
+    'www.defensenews.com',
+    'layoffs.fyi',
+    'news.un.org',
+    'www.cisa.gov',
+    'www.iaea.org',
+    'www.who.int',
+    'www.crisisgroup.org',
+    'english.alarabiya.net',
+    'www.arabnews.com',
+    'www.timesofisrael.com',
+    'www.scmp.com',
+    'kyivindependent.com',
+    'www.themoscowtimes.com',
+    'feeds.24.com',
+    'feeds.capi24.com',
+    'islandtimes.org',
+    'www.atlanticcouncil.org',
+  ].forEach((d) => domainSet.add(d));
+
+  const configFiles = [
+    path.join(process.cwd(), 'server', 'worldmonitor', 'news', 'v1', '_feeds.ts'),
+    path.join(process.cwd(), 'src', 'config', 'feeds.ts'),
+    path.join(process.cwd(), 'src', 'config', 'variants', 'tech.ts'),
+    path.join(process.cwd(), 'src', 'config', 'variants', 'finance.ts'),
+  ];
+
+  for (const filePath of configFiles) {
+    for (const domain of extractDomainsFromFile(filePath)) {
+      domainSet.add(domain);
+    }
+  }
+
+  for (const extra of parseCsvList(process.env.RELAY_RSS_ALLOWED_DOMAINS || '')) {
+    const normalized = normalizeDomainInput(extra);
+    if (normalized) domainSet.add(normalized);
+  }
+
+  const blockedSet = new Set(['rsshub.app']);
+  for (const blocked of parseCsvList(process.env.RELAY_RSS_BLOCKED_DOMAINS || '')) {
+    const normalized = normalizeDomainInput(blocked);
+    if (normalized) blockedSet.add(normalized);
+  }
+
+  for (const domain of blockedSet) {
+    domainSet.delete(domain);
+  }
+
+  for (const domain of [...domainSet]) {
+    if (isUnsafeRssHost(domain)) {
+      domainSet.delete(domain);
+    }
+  }
+
+  if (!RELAY_ERRORS_ONLY_LOGGING) {
+    console.log(`[Relay] RSS allowlist loaded: ${domainSet.size} domains`);
+  }
+
+  return { domainSet, blockedSet };
+}
+
+const { domainSet: RELAY_RSS_ALLOWED_DOMAINS, blockedSet: RELAY_RSS_BLOCKED_DOMAINS } = buildRelayRssAllowedDomains();
 
 // Local disk cache persistence (best for strict-rate APIs; survives relay restarts)
 const RELAY_DISK_CACHE_ENABLED = envEnabled('RELAY_DISK_CACHE_ENABLED', true);
@@ -363,6 +513,9 @@ const TELEGRAM_ENABLED = Boolean(process.env.TELEGRAM_API_ID && process.env.TELE
 const TELEGRAM_POLL_INTERVAL_MS = Math.max(15_000, Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 60_000));
 const TELEGRAM_MAX_FEED_ITEMS = Math.max(50, Number(process.env.TELEGRAM_MAX_FEED_ITEMS || 200));
 const TELEGRAM_MAX_TEXT_CHARS = Math.max(200, Number(process.env.TELEGRAM_MAX_TEXT_CHARS || 800));
+const TELEGRAM_CONNECTION_RETRIES = Math.max(1, Number(process.env.TELEGRAM_CONNECTION_RETRIES || 5));
+const TELEGRAM_RECEIVE_UPDATES = envEnabled('TELEGRAM_RECEIVE_UPDATES', false);
+const TELEGRAM_TRANSIENT_LOG_THROTTLE_MS = Math.max(5_000, Number(process.env.TELEGRAM_TRANSIENT_LOG_THROTTLE_MS || 30_000));
 
 const telegramState = {
   client: null,
@@ -387,6 +540,52 @@ const orefState = {
   _lastPersistedVersion: 0,
   _persistInFlight: false,
 };
+
+let telegramLastTransientLogAt = 0;
+
+function telegramErrorMessage(err) {
+  if (!err) return '';
+  if (typeof err === 'string') return err;
+  if (typeof err?.message === 'string') return err.message;
+  return String(err);
+}
+
+function isTelegramTransientConnectionError(err) {
+  const msg = telegramErrorMessage(err).toLowerCase();
+  return (
+    msg.includes('not connected')
+    || msg.includes('timeout')
+    || msg.includes('timed out')
+    || msg.includes('socket hang up')
+    || msg.includes('connection reset')
+    || msg.includes('ecconnreset')
+    || msg.includes('econnreset')
+    || msg.includes('etimedout')
+    || msg.includes('network')
+  );
+}
+
+function shouldLogTelegramTransient() {
+  const now = Date.now();
+  if (now - telegramLastTransientLogAt < TELEGRAM_TRANSIENT_LOG_THROTTLE_MS) return false;
+  telegramLastTransientLogAt = now;
+  return true;
+}
+
+async function resetTelegramClient(reason) {
+  const client = telegramState.client;
+  telegramState.client = null;
+  if (!client) return;
+  try {
+    await Promise.race([
+      client.disconnect(),
+      new Promise((resolve) => setTimeout(resolve, 3_000)),
+    ]);
+  } catch {}
+  if (reason && shouldLogTelegramTransient()) {
+    console.warn(`[Relay] Telegram client reset (${reason})`);
+  }
+}
 
 function loadTelegramChannels() {
   // Product-managed curated list lives in repo root under data/ (shared by web + desktop).
@@ -459,7 +658,9 @@ async function initTelegramClientIfNeeded() {
     const { StringSession } = await import('telegram/sessions/index.js');
 
     const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
-      connectionRetries: 3,
+      connectionRetries: TELEGRAM_CONNECTION_RETRIES,
+      // Relay polls channels via getMessages; update loop is unnecessary and can emit noisy timeout stacks.
+      receiveUpdates: TELEGRAM_RECEIVE_UPDATES,
     });
 
     await client.connect();
@@ -562,6 +763,14 @@ async function pollTelegramOnce() {
       if (/FLOOD_WAIT/.test(em)) {
         const wait = parseInt(em.match(/(\d+)/)?.[1] || '60', 10);
         console.warn(`[Relay] Telegram FLOOD_WAIT ${wait}s — stopping poll cycle early`);
+        break;
+      }
+      if (isTelegramTransientConnectionError(e)) {
+        telegramState.lastError = `telegram transient connection issue: ${em}`;
+        if (shouldLogTelegramTransient()) {
+          console.warn(`[Relay] Telegram transient connection issue on ${handle} (${em}) — reconnecting`);
+        }
+        await resetTelegramClient(`poll:${handle}`);
         break;
       }
     }
@@ -3430,42 +3639,30 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing url parameter' }));
       }
 
-      // Allow domains that block Vercel IPs (must match feeds.ts railwayRss usage)
-      const allowedDomains = [
-        // Original
-        'rss.cnn.com',
-        'www.defensenews.com',
-        'layoffs.fyi',
-        // International Organizations
-        'news.un.org',
-        'www.cisa.gov',
-        'www.iaea.org',
-        'www.who.int',
-        'www.crisisgroup.org',
-        // Middle East & Regional News
-        'english.alarabiya.net',
-        'www.arabnews.com',
-        'www.timesofisrael.com',
-        'www.scmp.com',
-        'kyivindependent.com',
-        'www.themoscowtimes.com',
-        // Africa
-        'feeds.24.com',
-        'feeds.capi24.com',  // News24 redirect destination
-        'islandtimes.org',
-        'www.atlanticcouncil.org',
-      ];
-      const parsed = new URL(feedUrl);
-      // Block deprecated/stale feed domains — stale clients still request these
-      const blockedDomains = ['rsshub.app'];
-      if (blockedDomains.includes(parsed.hostname)) {
-        res.writeHead(410, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Feed deprecated' }));
+      const validateRssTarget = (targetUrl) => {
+        const parsedTarget = new URL(targetUrl);
+        if (parsedTarget.protocol !== 'http:' && parsedTarget.protocol !== 'https:') {
+          return { ok: false, statusCode: 400, message: 'Unsupported protocol' };
+        }
+        const hostname = String(parsedTarget.hostname || '').toLowerCase();
+        if (isUnsafeRssHost(hostname)) {
+          return { ok: false, statusCode: 403, message: 'Unsafe host not allowed' };
+        }
+        if (RELAY_RSS_BLOCKED_DOMAINS.has(hostname)) {
+          return { ok: false, statusCode: 410, message: 'Feed deprecated' };
+        }
+        if (!RELAY_RSS_ALLOWED_DOMAINS.has(hostname)) {
+          return { ok: false, statusCode: 403, message: 'Domain not allowed on relay proxy' };
+        }
+        return { ok: true, parsedTarget };
+      };
+
+      const targetValidation = validateRssTarget(feedUrl);
+      if (!targetValidation.ok) {
+        res.writeHead(targetValidation.statusCode, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: targetValidation.message }));
       }
-      if (!allowedDomains.includes(parsed.hostname)) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Domain not allowed on Railway proxy' }));
-      }
+      feedUrl = targetValidation.parsedTarget.href;
 
       // Serve from cache if fresh (5 min for success, 1 min for failures)
       const rssCached = rssResponseCache.get(feedUrl);
@@ -3525,12 +3722,18 @@ const server = http.createServer(async (req, res) => {
           return sendError(502, 'Too many redirects');
         }
 
+        const validation = validateRssTarget(url);
+        if (!validation.ok) {
+          return sendError(validation.statusCode, validation.message);
+        }
+        const safeUrl = validation.parsedTarget.href;
+
         const conditionalHeaders = {};
         if (rssCached?.etag) conditionalHeaders['If-None-Match'] = rssCached.etag;
         if (rssCached?.lastModified) conditionalHeaders['If-Modified-Since'] = rssCached.lastModified;
 
-        const protocol = url.startsWith('https') ? https : http;
-        const request = protocol.get(url, {
+        const protocol = safeUrl.startsWith('https') ? https : http;
+        const request = protocol.get(safeUrl, {
           headers: {
             'Accept': 'application/rss+xml, application/xml, text/xml, */*',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -3542,7 +3745,7 @@ const server = http.createServer(async (req, res) => {
           if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
             const redirectUrl = response.headers.location.startsWith('http')
               ? response.headers.location
-              : new URL(response.headers.location, url).href;
+              : new URL(response.headers.location, safeUrl).href;
             logThrottled('log', `rss-redirect:${feedUrl}:${redirectUrl}`, `[Relay] Following redirect to: ${redirectUrl}`);
             return fetchWithRedirects(redirectUrl, redirectCount + 1);
           }
@@ -3783,8 +3986,14 @@ function connectUpstream() {
 const wss = new WebSocketServer({ server });
 
 server.listen(PORT, () => {
-  console.log(`[Relay] WebSocket relay on port ${PORT}`);
-  console.log(`[Relay] HTTP request logging: ${RELAY_VERBOSE_HTTP ? 'enabled' : 'disabled'} (set RELAY_VERBOSE_HTTP=true|false)`);
+  if (RELAY_ERRORS_ONLY_LOGGING) {
+    relayConsole.log(
+      `[Relay] Started OK on port ${PORT} (heap=${(_heapStats.heap_size_limit / 1024 / 1024).toFixed(0)}MB, errors-only logging)`,
+    );
+  } else {
+    console.log(`[Relay] WebSocket relay on port ${PORT}`);
+    console.log(`[Relay] HTTP request logging: ${RELAY_VERBOSE_HTTP ? 'enabled' : 'disabled'} (set RELAY_VERBOSE_HTTP=true|false)`);
+  }
   startTelegramPollLoop();
   startOrefPollLoop();
 });
@@ -3867,3 +4076,17 @@ async function gracefulShutdown(signal) {
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  const msg = telegramErrorMessage(reason);
+  const stack = typeof reason?.stack === 'string' ? reason.stack : '';
+  const fromTelegram = stack.includes('/node_modules/telegram/');
+  if (fromTelegram && isTelegramTransientConnectionError(reason)) {
+    telegramState.lastError = `telegram transient rejection: ${msg}`;
+    if (shouldLogTelegramTransient()) {
+      relayConsole.warn(`[Relay] Telegram transient rejection (${msg}) — reconnecting client`);
+    }
+    void resetTelegramClient('unhandledRejection');
+    return;
+  }
+  relayConsole.error('[Relay] Unhandled promise rejection:', reason);
+});

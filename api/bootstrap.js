@@ -51,9 +51,25 @@ function hasEnvSecret(key) {
   return typeof process.env[key] === 'string' && process.env[key].trim().length > 0;
 }
 
+function envEnabled(name) {
+  const raw = process.env[name];
+  if (typeof raw !== 'string' || !raw.trim()) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+function isOpenAiProviderDisabled() {
+  return envEnabled('LLM_DISABLE_OPENAI')
+    || envEnabled('DISABLE_OPENAI')
+    || envEnabled('OPENAI_DISABLED');
+}
+
 function computeFeatureAvailability() {
   const features = {};
   for (const [featureId, requiredSecrets] of Object.entries(FEATURE_SECRET_REQUIREMENTS)) {
+    if (featureId === 'aiOpenAI' && isOpenAiProviderDisabled()) {
+      features[featureId] = false;
+      continue;
+    }
     features[featureId] = requiredSecrets.every(hasEnvSecret);
   }
   return features;

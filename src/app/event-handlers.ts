@@ -582,6 +582,15 @@ export class EventHandlerManager implements AppModule {
           this.applyPanelSettings();
         }
       },
+      resetLayout: () => {
+        const confirmed = window.confirm('Restore default panel order and size? This will reload the page.');
+        if (!confirmed) return;
+        localStorage.removeItem(this.ctx.PANEL_ORDER_KEY);
+        localStorage.removeItem(this.ctx.PANEL_SPANS_KEY);
+        localStorage.removeItem('worldmonitor-panel-col-spans');
+        localStorage.removeItem('map-height');
+        window.location.reload();
+      },
       getDisabledSources: () => this.ctx.disabledSources,
       toggleSource: (name: string) => {
         if (this.ctx.disabledSources.has(name)) {
