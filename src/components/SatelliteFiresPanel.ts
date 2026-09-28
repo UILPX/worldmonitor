@@ -90,10 +90,5 @@ function escapeHtml(s: string): string {
 }
 
 function timeSince(date: Date): string {
-  const secs = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (secs < 60) return t('components.satelliteFires.time.justNow');
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return t('components.satelliteFires.time.minutesAgo', { count: String(mins) });
-  const hrs = Math.floor(mins / 60);
-  return t('components.satelliteFires.time.hoursAgo', { count: String(hrs) });
+  return date.toLocaleString();
 }

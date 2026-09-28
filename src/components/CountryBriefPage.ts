@@ -574,11 +574,7 @@ export class CountryBriefPage {
   }
 
   private timeAgo(date: Date): string {
-    const ms = Date.now() - new Date(date).getTime();
-    const hours = Math.floor(ms / 3600000);
-    if (hours < 1) return t('modals.countryBrief.timeAgo.m', { count: Math.floor(ms / 60000) });
-    if (hours < 24) return t('modals.countryBrief.timeAgo.h', { count: hours });
-    return t('modals.countryBrief.timeAgo.d', { count: Math.floor(hours / 24) });
+    return new Date(date).toLocaleString();
   }
 
   private formatBrief(text: string, headlineCount = 0): string {

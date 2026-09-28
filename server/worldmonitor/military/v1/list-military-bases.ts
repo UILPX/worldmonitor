@@ -20,6 +20,7 @@ const VALID_KINDS = new Set([
   'nuclear_explosion_site', 'range',
 ]);
 const COUNTRY_RE = /^[A-Z]{2}$/;
+let militaryBasesMissingActiveVersionLogged = false;
 
 const quantize = (v: number, step: number) => Math.round(v / step) * step;
 
@@ -138,7 +139,10 @@ export async function listMilitaryBases(
     if (!activeVersion) {
       markNoCacheResponse(ctx.request);
       setResponseHeader(ctx.request, 'X-Bases-Debug', 'no-active-version');
-      console.warn('military:bases:active key missing — run seed script');
+      if (!militaryBasesMissingActiveVersionLogged) {
+        militaryBasesMissingActiveVersionLogged = true;
+        console.error('military:bases:active key missing — run seed script');
+      }
       return empty;
     }
     const v = String(activeVersion);

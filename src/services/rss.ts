@@ -363,7 +363,8 @@ export async function fetchCategoryFeeds(
     options.onBatch?.(ensureSortedDescending());
   }
 
-  if (totalItems > 0) {
+  if (filteredFeeds.length > 0) {
+    // Successful fetch cycle indicates source health, even when 0 items are returned.
     dataFreshness.recordUpdate('rss', totalItems);
   }
 

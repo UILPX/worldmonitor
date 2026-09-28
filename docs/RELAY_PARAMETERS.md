@@ -62,9 +62,38 @@ Set these before enabling strict relay auth.
 
 | Variable | Set On | Default | Required | Purpose |
 | --- | --- | --- | --- | --- |
+| `OPENSKY_CACHE_TTL_MS` | Railway/local relay | `900000` | No | Positive cache TTL for OpenSky responses (default 15 min). |
+| `OPENSKY_NEGATIVE_CACHE_TTL_MS` | Railway/local relay | `600000` | No | Negative cache TTL for OpenSky `429/5xx` (default 10 min). |
 | `OPENSKY_CACHE_MAX_ENTRIES` | Railway | `128` | No | Max positive cache keys retained in memory. |
 | `OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES` | Railway | `256` | No | Max negative cache keys (`429/5xx`) retained in memory. |
 | `OPENSKY_BBOX_QUANT_STEP` | Railway | `0.01` | No | Coordinate quantization step for bbox cache key reuse. `0` disables quantization. |
+| `OPENSKY_REQUEST_SPACING_MS` | Railway/local relay | `12000` | No | Minimum spacing between upstream OpenSky requests (global serialized gate). |
+| `OPENSKY_429_COOLDOWN_MS` | Railway/local relay | `600000` | No | Global cooldown after a single upstream OpenSky `429`. |
+
+## Local Disk Cache Persistence
+
+Useful for local deployments: keeps expensive API cache warm across relay restarts.
+
+| Variable | Set On | Default | Required | Purpose |
+| --- | --- | --- | --- | --- |
+| `RELAY_DISK_CACHE_ENABLED` | Local relay | `true` | No | Enable disk-backed cache snapshots. |
+| `RELAY_DISK_CACHE_DIR` | Local relay | `./tmp/relay-cache` | No | Directory for cache snapshot files. |
+| `RELAY_DISK_CACHE_FLUSH_INTERVAL_MS` | Local relay | `300000` | No | Periodic snapshot flush interval. |
+| `RELAY_DISK_CACHE_MAX_FILE_BYTES` | Local relay | `12582912` | No | Max bytes per snapshot file (write is skipped if exceeded). |
+| `RELAY_DISK_CACHE_MAX_ENTRY_BYTES` | Local relay | `1048576` | No | Max bytes per cached entry saved to disk. |
+| `RELAY_DISK_CACHE_OPENSKY` | Local relay | `true` | No | Persist OpenSky positive + negative cache maps. |
+| `RELAY_DISK_CACHE_OPENSKY_MAX_ENTRIES` | Local relay | `24` | No | Max OpenSky keys persisted to disk. |
+| `RELAY_DISK_CACHE_OPENSKY_MAX_AGE_MS` | Local relay | `3600000` | No | Max age of OpenSky entries restored from disk. |
+| `RELAY_DISK_CACHE_UCDP` | Local relay | `true` | No | Persist UCDP aggregated payload. |
+| `RELAY_DISK_CACHE_UCDP_MAX_AGE_MS` | Local relay | `172800000` | No | Max age of UCDP snapshot restored from disk. |
+| `RELAY_DISK_CACHE_WORLDBANK` | Local relay | `true` | No | Persist World Bank proxy cache. |
+| `RELAY_DISK_CACHE_WORLDBANK_MAX_ENTRIES` | Local relay | `80` | No | Max World Bank keys persisted to disk. |
+| `RELAY_DISK_CACHE_WORLDBANK_MAX_AGE_MS` | Local relay | `86400000` | No | Max age of World Bank entries restored from disk. |
+| `RELAY_DISK_CACHE_POLYMARKET` | Local relay | `true` | No | Persist Polymarket proxy cache. |
+| `RELAY_DISK_CACHE_POLYMARKET_MAX_ENTRIES` | Local relay | `40` | No | Max Polymarket keys persisted to disk. |
+| `RELAY_DISK_CACHE_POLYMARKET_MAX_AGE_MS` | Local relay | `21600000` | No | Max age of Polymarket entries restored from disk. |
+| `RELAY_DISK_CACHE_NOTAM` | Local relay | `true` | No | Persist NOTAM relay cache. |
+| `RELAY_DISK_CACHE_NOTAM_MAX_AGE_MS` | Local relay | `86400000` | No | Max age of NOTAM cache restored from disk. |
 
 ## AIS Pipeline Tuning
 
@@ -114,6 +143,10 @@ ALLOW_UNAUTHENTICATED_RELAY=false
 OPENSKY_CACHE_MAX_ENTRIES=256
 OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES=512
 OPENSKY_BBOX_QUANT_STEP=0.01
+OPENSKY_CACHE_TTL_MS=900000
+OPENSKY_NEGATIVE_CACHE_TTL_MS=600000
+OPENSKY_REQUEST_SPACING_MS=12000
+OPENSKY_429_COOLDOWN_MS=600000
 
 # AIS pipeline
 AIS_SNAPSHOT_INTERVAL_MS=3000
@@ -130,6 +163,16 @@ RELAY_OPENSKY_RATE_LIMIT_MAX=600
 RELAY_RSS_RATE_LIMIT_MAX=300
 RELAY_LOG_THROTTLE_MS=10000
 RELAY_METRICS_WINDOW_SECONDS=60
+
+# Local disk persistence (optional but recommended for strict quotas)
+RELAY_DISK_CACHE_ENABLED=true
+RELAY_DISK_CACHE_DIR=./tmp/relay-cache
+RELAY_DISK_CACHE_FLUSH_INTERVAL_MS=300000
+RELAY_DISK_CACHE_OPENSKY=true
+RELAY_DISK_CACHE_UCDP=true
+RELAY_DISK_CACHE_WORLDBANK=true
+RELAY_DISK_CACHE_POLYMARKET=true
+RELAY_DISK_CACHE_NOTAM=true
 ```
 
 ## 4) How to Verify Configuration

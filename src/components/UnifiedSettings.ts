@@ -15,6 +15,7 @@ const DESKTOP_RELEASES_URL = 'https://github.com/koala73/worldmonitor/releases';
 export interface UnifiedSettingsConfig {
   getPanelSettings: () => Record<string, PanelConfig>;
   togglePanel: (key: string) => void;
+  resetLayout: () => void;
   getDisabledSources: () => Set<string>;
   toggleSource: (name: string) => void;
   setSourcesEnabled: (names: string[], enabled: boolean) => void;
@@ -128,6 +129,12 @@ export class UnifiedSettings {
         this.config.setSourcesEnabled(visible, false);
         this.renderSourcesGrid();
         this.updateSourcesCounter();
+        return;
+      }
+
+      // Restore default layout
+      if (target.closest('.unified-settings-reset-layout')) {
+        this.config.resetLayout();
         return;
       }
     });
@@ -342,6 +349,16 @@ export class UnifiedSettings {
       html += `<option value="${lang.code}"${selected}>${lang.flag} ${lang.label}</option>`;
     }
     html += `</select>`;
+
+    // Layout section
+    html += `<div class="ai-flow-section-label">Layout</div>`;
+    html += `
+      <div class="unified-settings-action-row">
+        <button type="button" class="unified-settings-action-btn unified-settings-reset-layout">
+          Restore Default Panel Order & Size
+        </button>
+      </div>
+    `;
 
     // AI status footer (web-only)
     if (!this.config.isDesktopApp) {

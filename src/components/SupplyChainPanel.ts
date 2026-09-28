@@ -7,7 +7,6 @@ import type {
 import { t } from '@/services/i18n';
 import { escapeHtml } from '@/utils/sanitize';
 import { isFeatureAvailable } from '@/services/runtime-config';
-import { isDesktopRuntime } from '@/services/runtime';
 
 type TabId = 'chokepoints' | 'shipping' | 'minerals';
 
@@ -111,7 +110,7 @@ export class SupplyChainPanel extends Panel {
   }
 
   private renderShipping(): string {
-    if (isDesktopRuntime() && !isFeatureAvailable('supplyChain')) {
+    if (!isFeatureAvailable('supplyChain')) {
       return `<div class="economic-empty">${t('components.supplyChain.fredKeyMissing')}</div>`;
     }
 

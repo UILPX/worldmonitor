@@ -1384,12 +1384,14 @@ Transactions are sampled at 10% to balance observability with cost. Release trac
 git clone https://github.com/koala73/worldmonitor.git
 cd worldmonitor
 npm install
-vercel dev       # Runs frontend + all 60+ API edge functions
+cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
 ```
 
 Open [http://localhost:3000](http://localhost:3000)
 
 > **Note**: `vercel dev` requires the [Vercel CLI](https://vercel.com/docs/cli) (`npm i -g vercel`). If you use `npm run dev` instead, only the frontend starts — news feeds and API-dependent panels won't load. See [Self-Hosting](#self-hosting) for details.
+>
+> If you hit `EPERM: operation not permitted, scandir '/Users/xp/.Trash/'`, start from the project directory using the one-line command above.
 
 ### Environment Variables (Optional)
 
@@ -1404,7 +1406,7 @@ The `.env.example` file documents every variable with descriptions and registrat
 | Group             | Variables                                                                  | Free Tier                                  |
 | ----------------- | -------------------------------------------------------------------------- | ------------------------------------------ |
 | **AI (Local)**    | `OLLAMA_API_URL`, `OLLAMA_MODEL`                                           | Free (runs on your hardware)               |
-| **AI (Cloud)**    | `GROQ_API_KEY`, `OPENROUTER_API_KEY`                                       | 14,400 req/day (Groq), 50/day (OpenRouter) |
+| **AI (Cloud)**    | `OPENAI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`                     | Paid usage (OpenAI), free tiers for Groq/OpenRouter |
 | **Cache**         | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`                       | 10K commands/day                           |
 | **Markets**       | `FINNHUB_API_KEY`, `FRED_API_KEY`, `EIA_API_KEY`                           | All free tier                              |
 | **Tracking**      | `WINGBITS_API_KEY`, `AISSTREAM_API_KEY`                                    | Free                                       |
@@ -1439,7 +1441,7 @@ To run everything locally (frontend + edge functions):
 ```bash
 npm install -g vercel
 cp .env.example .env.local   # Add your API keys
-vercel dev                   # Starts on http://localhost:3000
+cd /Users/xp/Code/worldmonitor && export PATH="/opt/homebrew/opt/node@20/bin:$PATH" && npx vercel dev --yes --listen 3000
 ```
 
 > **Important**: Use `vercel dev` instead of `npm run dev`. The Vercel CLI emulates the edge runtime locally so all `api/` endpoints work. Plain `npm run dev` only starts Vite and the API layer won't be available.
@@ -1462,7 +1464,7 @@ This runs the frontend without the API layer. Panels that require server-side pr
 | **Linux x86_64**       | Full support            | Works with `vercel dev` for local development. Desktop .AppImage available for x86_64. WebKitGTK rendering uses DMA-BUF with fallback to SHM for GPU compatibility. Font stack includes DejaVu Sans Mono and Liberation Mono for consistent rendering across distros |
 | **macOS**              | Works with `vercel dev` | Full local development                                                                                                         |
 | **Raspberry Pi / ARM** | Partial                 | `vercel dev` edge runtime emulation may not work on ARM. Use Option 1 (deploy to Vercel) or Option 3 (static frontend) instead |
-| **Docker**             | Planned                 | See [Roadmap](#roadmap)                                                                                                        |
+| **Docker**             | Supported (local self-host) | Use `docker compose up -d --build` with provided `docker-compose.yml`                                                      |
 
 ### Railway Relay (Optional)
 
@@ -1471,6 +1473,9 @@ The Railway relay is a multi-protocol gateway that handles data sources requirin
 ```bash
 # On Railway, deploy with:
 node scripts/ais-relay.cjs
+
+# Local (loads API keys from .env.local), default port :3004
+cd /Users/xp/Code/worldmonitor && set -a && source .env.local && set +a && node scripts/ais-relay.cjs
 ```
 
 | Service                 | Protocol        | Purpose                                                              |
@@ -1483,6 +1488,48 @@ node scripts/ais-relay.cjs
 | **ICAO NOTAM**          | REST            | Airport/airspace closure detection for 46 MENA airports              |
 
 Set `WS_RELAY_URL` (server-side, HTTPS) and `VITE_WS_RELAY_URL` (client-side, WSS) in your environment. Without the relay, AIS, OpenSky, Telegram, and OREF layers won't show live data, but all other features work normally.
+
+### Docker Local Deployment (Windows / macOS / Linux)
+
+This repository includes Docker assets for running both services together:
+
+- `web`: Vercel edge-runtime dev server on port `3000`
+- `relay`: AIS/OpenSky/Telegram relay on port `3004`
+
+```bash
+# In repo root
+# Build/create only (do NOT start containers)
+docker compose up --build --no-start
+
+# Start later when needed
+docker compose start web relay
+```
+
+Open <http://localhost:3000>.
+
+Useful commands:
+
+```bash
+# View logs
+docker compose logs -f web relay
+
+# Restart one service
+docker compose restart web
+docker compose restart relay
+
+# Stop services
+docker compose down
+```
+
+Notes:
+
+- `web` builds one image (`worldmonitor-app:local`), and `relay` reuses the same image (two containers, one image).
+- `docker-compose.yml` pins both services to `platform: linux/amd64` (for Windows x64 compatibility).
+- `docker compose up --build --no-start` builds successfully without auto-running containers.
+- `docker-compose.yml` overrides `WS_RELAY_URL` to `http://relay:3004` for server-side calls.
+- Browser-side relay URLs are set to `localhost:3004`.
+- Relay cache persistence is stored in Docker volume `relay-cache` mounted to `/app/tmp/relay-cache`.
+- Configure `OLLAMA_API_URL` in `.env.local` (for example `http://192.168.10.80:11434` for a LAN Ollama host).
 
 ---
 

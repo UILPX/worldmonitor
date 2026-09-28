@@ -214,14 +214,7 @@ export function formatArticleDate(dateStr: string): string {
     const sec = dateStr.slice(13, 15);
     const date = new Date(`${year}-${month}-${day}T${hour}:${min}:${sec}Z`);
     if (isNaN(date.getTime())) return '';
-
-    const now = Date.now();
-    const diff = now - date.getTime();
-
-    if (diff < 0) return 'just now';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-    return `${Math.floor(diff / 86400000)}d ago`;
+    return date.toLocaleString();
   } catch {
     return '';
   }

@@ -3,6 +3,7 @@ import { t } from '@/services/i18n';
 import { escapeHtml } from '@/utils/sanitize';
 import { formatPrice, formatChange, getChangeClass } from '@/utils';
 import { miniSparkline } from '@/utils/sparkline';
+import { MANUAL_REFRESH_ONLY } from '@/config/request-mode';
 import { MarketServiceClient } from '@/generated/client/worldmonitor/market/v1/service_client';
 import type { ListGulfQuotesResponse, GulfQuote } from '@/generated/client/worldmonitor/market/v1/service_client';
 
@@ -48,7 +49,7 @@ export class GulfEconomiesPanel extends Panel {
       this.showError(t('common.failedMarketData'));
     }
 
-    if (!this.pollTimer) {
+    if (!MANUAL_REFRESH_ONLY && !this.pollTimer) {
       this.pollTimer = setInterval(() => void this.fetchData(), 60_000);
     }
   }

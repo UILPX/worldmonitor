@@ -4,6 +4,7 @@ import { fetchCachedTheaterPosture, type CachedTheaterPosture } from '@/services
 import { fetchMilitaryVessels } from '@/services/military-vessels';
 import { recalcPostureWithVessels, type TheaterPostureSummary } from '@/services/military-surge';
 import { isDesktopRuntime } from '@/services/runtime';
+import { isFeatureAvailable } from '@/services/runtime-config';
 import { t } from '../services/i18n';
 import type { NewsItem, DeductContextDetail } from '@/types';
 import { buildNewsContext } from '@/utils/news-context';
@@ -122,6 +123,12 @@ export class StrategicPosturePanel extends Panel {
     if (!this.isPanelVisible()) return;
 
     try {
+      if (!isFeatureAvailable('openskyRelay')) {
+        this.stopLoadingTimer();
+        this.showConfigError('OpenSky relay not configured — add OPENSKY_CLIENT_ID, OPENSKY_CLIENT_SECRET, and VITE_OPENSKY_RELAY_URL in Settings.');
+        return;
+      }
+
       // Fetch aircraft data from server
       this.showLoadingStage('aircraft');
       const data = await fetchCachedTheaterPosture(this.signal);

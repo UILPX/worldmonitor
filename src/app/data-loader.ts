@@ -1,5 +1,5 @@
 import type { AppContext, AppModule } from '@/app/app-context';
-import type { NewsItem, MapLayers, SocialUnrestEvent } from '@/types';
+import type { ClusteredEvent, NewsItem, MapLayers, SocialUnrestEvent } from '@/types';
 import type { MarketData } from '@/types';
 import type { TimeRange } from '@/components';
 import {
@@ -11,6 +11,18 @@ import {
   SITE_VARIANT,
   LAYER_TO_SOURCE,
 } from '@/config';
+import {
+  REGIONAL_NEWS_FEED_KEYS,
+  REGIONAL_NEWS_SELECTION_STORAGE_KEY,
+  REGIONAL_NEWS_SELECTION_EVENT,
+  FULL_FINANCE_NEWS_FEED_KEYS,
+  DEFAULT_FULL_FINANCE_NEWS_FEED_KEY,
+  FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY,
+  FULL_FINANCE_NEWS_SELECTION_EVENT,
+  inferRegionalNewsFeedFromView,
+  type RegionalNewsFeedKey,
+  type FullFinanceNewsFeedKey,
+} from '@/config/feeds';
 import { INTEL_HOTSPOTS, CONFLICT_ZONES } from '@/config/geo';
 import { tokenizeForMatch, matchKeyword } from '@/utils/keyword-match';
 import {
@@ -59,7 +71,7 @@ import {
 } from '@/services';
 import { checkBatchForBreakingAlerts, dispatchOrefBreakingAlert } from '@/services/breaking-news-alerts';
 import { mlWorker } from '@/services/ml-worker';
-import { clusterNewsHybrid } from '@/services/clustering';
+import { clusterNews, clusterNewsHybrid } from '@/services/clustering';
 import { ingestProtests, ingestFlights, ingestVessels, ingestEarthquakes, detectGeoConvergence, geoConvergenceToSignal } from '@/services/geo-convergence';
 import { signalAggregator } from '@/services/signal-aggregator';
 import { updateAndCheck } from '@/services/temporal-baseline';
@@ -81,13 +93,12 @@ import { isFeatureAvailable, isFeatureEnabled } from '@/services/runtime-config'
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { t, getCurrentLanguage } from '@/services/i18n';
 import { getHydratedData } from '@/services/bootstrap';
+import { MANUAL_REFRESH_ONLY } from '@/config/request-mode';
 import { canQueueAiClassification, AI_CLASSIFY_MAX_PER_FEED } from '@/services/ai-classify-queue';
 import { classifyWithAI } from '@/services/threat-classifier';
 import { ingestHeadlines } from '@/services/trending-keywords';
 import type { ListFeedDigestResponse } from '@/generated/client/worldmonitor/news/v1/service_client';
 import type { GetSectorSummaryResponse } from '@/generated/client/worldmonitor/market/v1/service_client';
-import { maybeShowDownloadBanner } from '@/components/DownloadBanner';
-import { mountCommunityWidget } from '@/components/CommunityWidget';
 import { ResearchServiceClient } from '@/generated/client/worldmonitor/research/v1/service_client';
 import {
   MarketPanel,
@@ -105,6 +116,7 @@ import {
   DisplacementPanel,
   ClimateAnomalyPanel,
   PopulationExposurePanel,
+  TimelineBriefsPanel,
   TradePolicyPanel,
   SupplyChainPanel,
   SecurityAdvisoriesPanel,
@@ -158,6 +170,13 @@ function protoItemToNewsItem(p: ProtoNewsItem): NewsItem {
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
 
+function readPositiveEnvInt(raw: unknown, fallback: number): number {
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
 export interface DataLoaderCallbacks {
   renderCriticalBanner: (postures: TheaterPostureSummary[]) => void;
 }
@@ -175,57 +194,150 @@ export class DataLoaderManager implements AppModule {
   public updateSearchIndex: () => void = () => {};
 
   private digestBreaker = { state: 'closed' as 'closed' | 'open' | 'half-open', failures: 0, cooldownUntil: 0 };
-  private readonly digestRequestTimeoutMs = 8000;
-  private readonly digestBreakerCooldownMs = 5 * 60 * 1000;
+  private readonly digestRequestTimeoutMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_REQUEST_TIMEOUT_MS,
+    30_000,
+  );
+  private readonly digestWarmupRetryTimeoutMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_WARMUP_TIMEOUT_MS,
+    55_000,
+  );
+  private readonly digestRequestRetryDelayMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_RETRY_DELAY_MS,
+    1_500,
+  );
+  private readonly digestBreakerCooldownMs = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_BREAKER_COOLDOWN_MS,
+    90_000,
+  );
+  private readonly digestBreakerFailureThreshold = readPositiveEnvInt(
+    import.meta.env.VITE_NEWS_DIGEST_BREAKER_FAILURES,
+    4,
+  );
   private readonly persistedDigestMaxAgeMs = 6 * 60 * 60 * 1000;
   private readonly perFeedFallbackCategoryFeedLimit = 3;
   private readonly perFeedFallbackIntelFeedLimit = 6;
   private readonly perFeedFallbackBatchSize = 2;
   private lastGoodDigest: ListFeedDigestResponse | null = null;
+  private telegramPollingPausedUntil = 0;
+  private readonly handleRegionalNewsSelectionChanged = (): void => {
+    this.renderSelectedRegionalNews();
+  };
+  private readonly handleFullFinanceNewsSelectionChanged = (): void => {
+    this.renderSelectedFullFinanceNews();
+  };
 
   constructor(ctx: AppContext, callbacks: DataLoaderCallbacks) {
     this.ctx = ctx;
     this.callbacks = callbacks;
+    window.addEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
+    window.addEventListener(FULL_FINANCE_NEWS_SELECTION_EVENT, this.handleFullFinanceNewsSelectionChanged as EventListener);
   }
 
   init(): void {}
 
   destroy(): void {
+    window.removeEventListener(REGIONAL_NEWS_SELECTION_EVENT, this.handleRegionalNewsSelectionChanged as EventListener);
+    window.removeEventListener(FULL_FINANCE_NEWS_SELECTION_EVENT, this.handleFullFinanceNewsSelectionChanged as EventListener);
     stopOrefPolling();
+  }
+
+  private isRegionalNewsCategory(category: string): category is RegionalNewsFeedKey {
+    return REGIONAL_NEWS_FEED_KEYS.includes(category as RegionalNewsFeedKey);
+  }
+
+  private getSelectedRegionalNewsCategory(): RegionalNewsFeedKey {
+    const stored = localStorage.getItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && REGIONAL_NEWS_FEED_KEYS.includes(stored as RegionalNewsFeedKey)) {
+      return stored as RegionalNewsFeedKey;
+    }
+    return inferRegionalNewsFeedFromView(this.ctx.resolvedLocation);
+  }
+
+  private isFullFinanceNewsCategory(category: string): category is FullFinanceNewsFeedKey {
+    return FULL_FINANCE_NEWS_FEED_KEYS.includes(category as FullFinanceNewsFeedKey);
+  }
+
+  private getSelectedFullFinanceNewsCategory(): FullFinanceNewsFeedKey {
+    const stored = localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && FULL_FINANCE_NEWS_FEED_KEYS.includes(stored as FullFinanceNewsFeedKey)) {
+      return stored as FullFinanceNewsFeedKey;
+    }
+    return DEFAULT_FULL_FINANCE_NEWS_FEED_KEY;
+  }
+
+  private hasSharedRegionalPanel(category: string): boolean {
+    if (!this.isRegionalNewsCategory(category)) return false;
+    const panel = this.ctx.newsPanels[category];
+    if (!panel) return false;
+    return REGIONAL_NEWS_FEED_KEYS.some((key) => key !== category && this.ctx.newsPanels[key] === panel);
+  }
+
+  private hasSharedFullFinancePanel(category: string): boolean {
+    if (SITE_VARIANT !== 'full') return false;
+    if (!this.isFullFinanceNewsCategory(category)) return false;
+    const panel = this.ctx.newsPanels[category];
+    if (!panel) return false;
+    return FULL_FINANCE_NEWS_FEED_KEYS.some((key) => key !== category && this.ctx.newsPanels[key] === panel);
   }
 
   private async tryFetchDigest(): Promise<ListFeedDigestResponse | null> {
     const now = Date.now();
+    const cachedDigest = this.lastGoodDigest ?? await this.loadPersistedDigest();
 
     if (this.digestBreaker.state === 'open') {
       if (now < this.digestBreaker.cooldownUntil) {
-        return this.lastGoodDigest ?? await this.loadPersistedDigest();
+        // If no cached digest exists, do not keep the breaker open; try upstream immediately.
+        if (cachedDigest) return cachedDigest;
       }
       this.digestBreaker.state = 'half-open';
     }
 
-    try {
-      const resp = await fetch(
-        `/api/news/v1/list-feed-digest?variant=${SITE_VARIANT}&lang=${getCurrentLanguage()}`,
-        { signal: AbortSignal.timeout(this.digestRequestTimeoutMs) },
-      );
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json() as ListFeedDigestResponse;
-      const catCount = Object.keys(data.categories ?? {}).length;
-      console.info(`[News] Digest fetched: ${catCount} categories`);
-      this.lastGoodDigest = data;
-      this.persistDigest(data);
-      this.digestBreaker = { state: 'closed', failures: 0, cooldownUntil: 0 };
-      return data;
-    } catch (e) {
-      console.warn('[News] Digest fetch failed, using fallback:', e);
-      this.digestBreaker.failures++;
-      if (this.digestBreaker.failures >= 2) {
-        this.digestBreaker.state = 'open';
-        this.digestBreaker.cooldownUntil = now + this.digestBreakerCooldownMs;
+    const timeoutPlan = cachedDigest
+      ? [this.digestRequestTimeoutMs]
+      : [this.digestRequestTimeoutMs, Math.max(this.digestRequestTimeoutMs, this.digestWarmupRetryTimeoutMs)];
+    let lastError: unknown = null;
+
+    for (let i = 0; i < timeoutPlan.length; i++) {
+      try {
+        const timeoutMs = timeoutPlan[i]!;
+        const resp = await fetch(
+          `/api/news/v1/list-feed-digest?variant=${SITE_VARIANT}&lang=${getCurrentLanguage()}`,
+          { signal: AbortSignal.timeout(timeoutMs) },
+        );
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json() as ListFeedDigestResponse;
+        const catCount = Object.keys(data.categories ?? {}).length;
+        const totalItems = Object.values(data.categories ?? {}).reduce((sum, category) => {
+          return sum + (category?.items?.length ?? 0);
+        }, 0);
+
+        if (totalItems <= 0) {
+          throw new Error(`Digest empty (${catCount} categories, ${totalItems} items)`);
+        }
+
+        console.info(`[News] Digest fetched: ${catCount} categories, ${totalItems} items`);
+        dataFreshness.recordUpdate('rss', totalItems);
+        this.lastGoodDigest = data;
+        this.persistDigest(data);
+        this.digestBreaker = { state: 'closed', failures: 0, cooldownUntil: 0 };
+        return data;
+      } catch (e) {
+        lastError = e;
+        const hasNextAttempt = i < timeoutPlan.length - 1;
+        if (hasNextAttempt) {
+          await new Promise((resolve) => setTimeout(resolve, this.digestRequestRetryDelayMs));
+        }
       }
-      return this.lastGoodDigest ?? await this.loadPersistedDigest();
     }
+
+    console.warn('[News] Digest fetch failed, using fallback:', lastError);
+    this.digestBreaker.failures++;
+    if (this.digestBreaker.failures >= this.digestBreakerFailureThreshold) {
+      this.digestBreaker.state = 'open';
+      this.digestBreaker.cooldownUntil = now + this.digestBreakerCooldownMs;
+    }
+    return cachedDigest;
   }
 
   private persistDigest(data: ListFeedDigestResponse): void {
@@ -257,6 +369,21 @@ export class DataLoaderManager implements AppModule {
     return feeds.slice(0, maxFeeds);
   }
 
+  private reconcileDigestSourceFilter(
+    category: string,
+    digestItems: NewsItem[],
+    filteredItems: NewsItem[],
+    configuredNames: Set<string>,
+  ): NewsItem[] {
+    if (filteredItems.length > 0 || digestItems.length === 0) return filteredItems;
+    const hasConfiguredNameMatch = digestItems.some((item) => configuredNames.has(item.source));
+    if (hasConfiguredNameMatch) return filteredItems;
+    console.warn(
+      `[News] Digest source names drift for "${category}", bypassing source-name filter (${digestItems.length} items)`,
+    );
+    return digestItems;
+  }
+
   private shouldShowIntelligenceNotifications(): boolean {
     return !this.ctx.isMobile && !!this.ctx.findingsBadge?.isPopupEnabled();
   }
@@ -278,20 +405,49 @@ export class DataLoaderManager implements AppModule {
       { name: 'news', task: runGuarded('news', () => this.loadNews()) },
     ];
 
+    const isPanelEnabled = (panelId: string): boolean => this.ctx.panelSettings[panelId]?.enabled !== false;
+    const needsMarketData = isPanelEnabled('markets') || isPanelEnabled('commodities') || isPanelEnabled('heatmap');
+
     // Happy variant only loads news data -- skip all geopolitical/financial/military data
     if (SITE_VARIANT !== 'happy') {
-      tasks.push({ name: 'markets', task: runGuarded('markets', () => this.loadMarkets()) });
-      tasks.push({ name: 'predictions', task: runGuarded('predictions', () => this.loadPredictions()) });
+      if (needsMarketData && isFeatureAvailable('finnhubMarkets')) {
+        tasks.push({ name: 'markets', task: runGuarded('markets', () => this.loadMarkets()) });
+      } else if (needsMarketData) {
+        const finnhubConfigMsg = 'FINNHUB_API_KEY not configured — add in Settings';
+        this.ctx.panels['markets']?.showConfigError(finnhubConfigMsg);
+        this.ctx.panels['heatmap']?.showConfigError(finnhubConfigMsg);
+        this.ctx.panels['commodities']?.showConfigError(finnhubConfigMsg);
+      }
+      if (isPanelEnabled('polymarket')) {
+        tasks.push({ name: 'predictions', task: runGuarded('predictions', () => this.loadPredictions()) });
+      }
       tasks.push({ name: 'pizzint', task: runGuarded('pizzint', () => this.loadPizzInt()) });
-      tasks.push({ name: 'fred', task: runGuarded('fred', () => this.loadFredData()) });
-      tasks.push({ name: 'oil', task: runGuarded('oil', () => this.loadOilAnalytics()) });
-      tasks.push({ name: 'spending', task: runGuarded('spending', () => this.loadGovernmentSpending()) });
-      tasks.push({ name: 'bis', task: runGuarded('bis', () => this.loadBisData()) });
+      if (isPanelEnabled('economic')) {
+        if (isFeatureAvailable('economicFred')) {
+          tasks.push({ name: 'fred', task: runGuarded('fred', () => this.loadFredData()) });
+        }
+        if (isFeatureAvailable('energyEia')) {
+          tasks.push({ name: 'oil', task: runGuarded('oil', () => this.loadOilAnalytics()) });
+        }
+        if (!isFeatureAvailable('economicFred') && !isFeatureAvailable('energyEia')) {
+          this.ctx.panels['economic']?.showConfigError('FRED_API_KEY or EIA_API_KEY not configured — add in Settings');
+        }
+        tasks.push({ name: 'spending', task: runGuarded('spending', () => this.loadGovernmentSpending()) });
+        tasks.push({ name: 'bis', task: runGuarded('bis', () => this.loadBisData()) });
+      }
 
       // Trade policy data (FULL and FINANCE only)
       if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance') {
-        tasks.push({ name: 'tradePolicy', task: runGuarded('tradePolicy', () => this.loadTradePolicy()) });
-        tasks.push({ name: 'supplyChain', task: runGuarded('supplyChain', () => this.loadSupplyChain()) });
+        if (isPanelEnabled('trade-policy') && isFeatureAvailable('wtoTrade')) {
+          tasks.push({ name: 'tradePolicy', task: runGuarded('tradePolicy', () => this.loadTradePolicy()) });
+        } else if (isPanelEnabled('trade-policy')) {
+          this.ctx.panels['trade-policy']?.showConfigError('WTO_API_KEY not configured — add in Settings');
+        }
+        if (isPanelEnabled('supply-chain') && isFeatureAvailable('supplyChain')) {
+          tasks.push({ name: 'supplyChain', task: runGuarded('supplyChain', () => this.loadSupplyChain()) });
+        } else if (isPanelEnabled('supply-chain')) {
+          this.ctx.panels['supply-chain']?.showConfigError('FRED_API_KEY not configured — add in Settings');
+        }
       }
     }
 
@@ -342,12 +498,17 @@ export class DataLoaderManager implements AppModule {
 
     if (SITE_VARIANT === 'full') {
       tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
+      tasks.push({ name: 'timeline-briefs', task: runGuarded('timeline-briefs', () => this.loadTimelineBriefs()) });
     }
 
-    if (SITE_VARIANT === 'full') tasks.push({ name: 'firms', task: runGuarded('firms', () => this.loadFirmsData()) });
+    if (SITE_VARIANT === 'full' && isFeatureAvailable('nasaFirms')) {
+      tasks.push({ name: 'firms', task: runGuarded('firms', () => this.loadFirmsData()) });
+    } else if (SITE_VARIANT === 'full') {
+      this.ctx.panels['satellite-fires']?.showConfigError('NASA_FIRMS_API_KEY not configured — add in Settings');
+    }
     if (this.ctx.mapLayers.natural) tasks.push({ name: 'natural', task: runGuarded('natural', () => this.loadNatural()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.weather) tasks.push({ name: 'weather', task: runGuarded('weather', () => this.loadWeatherAlerts()) });
-    if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.ais) tasks.push({ name: 'ais', task: runGuarded('ais', () => this.loadAisSignals()) });
+    if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.ais && isFeatureAvailable('aisRelay')) tasks.push({ name: 'ais', task: runGuarded('ais', () => this.loadAisSignals()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.cables) tasks.push({ name: 'cables', task: runGuarded('cables', () => this.loadCableActivity()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.cables) tasks.push({ name: 'cableHealth', task: runGuarded('cableHealth', () => this.loadCableHealth()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.flights) tasks.push({ name: 'flights', task: runGuarded('flights', () => this.loadFlightDelays()) });
@@ -492,6 +653,36 @@ export class DataLoaderManager implements AppModule {
     }
   }
 
+  private clusterNewsWithFallback(items: NewsItem[]): ClusteredEvent[] {
+    if (items.length === 0) return [];
+
+    try {
+      const clustered = clusterNews(items);
+      if (clustered.length > 0) return clustered;
+    } catch (error) {
+      console.warn('[App] Local clustering fallback failed:', error);
+    }
+
+    // Last-resort fallback: treat each recent headline as a single-item cluster.
+    return items.slice(0, 80).map((item, index) => ({
+      id: `fallback-${item.pubDate.getTime()}-${index}`,
+      primaryTitle: item.title,
+      primarySource: item.source,
+      primaryLink: item.link,
+      sourceCount: 1,
+      topSources: [{ name: item.source, tier: item.tier ?? 3, url: item.link }],
+      allItems: [item],
+      firstSeen: item.pubDate,
+      lastUpdated: item.pubDate,
+      isAlert: Boolean(item.isAlert),
+      ...(item.monitorColor ? { monitorColor: item.monitorColor } : {}),
+      ...(item.threat ? { threat: item.threat } : {}),
+      ...(item.lat != null ? { lat: item.lat } : {}),
+      ...(item.lon != null ? { lon: item.lon } : {}),
+      ...(item.lang ? { lang: item.lang } : {}),
+    }));
+  }
+
   getTimeRangeWindowMs(range: TimeRange): number {
     const ranges: Record<TimeRange, number> = {
       '1h': 60 * 60 * 1000,
@@ -529,12 +720,28 @@ export class DataLoaderManager implements AppModule {
     this.ctx.newsByCategory[category] = items;
     const panel = this.ctx.newsPanels[category];
     if (!panel) return;
+    if (this.hasSharedRegionalPanel(category) && category !== this.getSelectedRegionalNewsCategory()) return;
+    if (this.hasSharedFullFinancePanel(category) && category !== this.getSelectedFullFinanceNewsCategory()) return;
     const filteredItems = this.filterItemsByTimeRange(items);
     if (filteredItems.length === 0 && items.length > 0) {
       panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
       return;
     }
     panel.renderNews(filteredItems);
+  }
+
+  public renderSelectedRegionalNews(): void {
+    const selectedCategory = this.getSelectedRegionalNewsCategory();
+    if (!(selectedCategory in this.ctx.newsByCategory)) return;
+    const items = this.ctx.newsByCategory[selectedCategory] ?? [];
+    this.renderNewsForCategory(selectedCategory, items);
+  }
+
+  public renderSelectedFullFinanceNews(): void {
+    const selectedCategory = this.getSelectedFullFinanceNewsCategory();
+    if (!(selectedCategory in this.ctx.newsByCategory)) return;
+    const items = this.ctx.newsByCategory[selectedCategory] ?? [];
+    this.renderNewsForCategory(selectedCategory, items);
   }
 
   applyTimeRangeFilterToNewsPanels(): void {
@@ -545,6 +752,58 @@ export class DataLoaderManager implements AppModule {
 
   applyTimeRangeFilterDebounced(): void {
     this.applyTimeRangeFilterToNewsPanelsDebounced();
+  }
+
+  private includesAnyKeyword(text: string, keywords: readonly string[]): boolean {
+    return keywords.some((keyword) => text.includes(keyword));
+  }
+
+  private bucketFullFinanceNews(items: NewsItem[]): Record<FullFinanceNewsFeedKey, NewsItem[]> {
+    const buckets: Record<FullFinanceNewsFeedKey, NewsItem[]> = {
+      finance: [...items],
+      markets: [],
+      commodities: [],
+      crypto: [],
+      economic: [],
+    };
+
+    const cryptoKeywords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'token', 'blockchain', 'stablecoin', 'defi'];
+    const commoditiesKeywords = ['oil', 'crude', 'brent', 'wti', 'opec', 'gas', 'lng', 'gold', 'silver', 'copper', 'commodity', 'wheat', 'corn', 'soy'];
+    const economicKeywords = ['inflation', 'cpi', 'gdp', 'payroll', 'jobs', 'unemployment', 'fed', 'central bank', 'interest rate', 'rate cut', 'rate hike', 'tariff', 'trade'];
+    const marketsKeywords = ['market', 'stocks', 'equity', 'nasdaq', 'dow', 's&p', 'bond', 'yield', 'forex', 'fx', 'index', 'volatility', 'earnings'];
+
+    for (const item of items) {
+      const text = `${item.title} ${item.source}`.toLowerCase();
+      if (this.includesAnyKeyword(text, cryptoKeywords)) {
+        buckets.crypto.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, commoditiesKeywords)) {
+        buckets.commodities.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, economicKeywords)) {
+        buckets.economic.push(item);
+        continue;
+      }
+      if (this.includesAnyKeyword(text, marketsKeywords)) {
+        buckets.markets.push(item);
+        continue;
+      }
+      buckets.markets.push(item);
+    }
+
+    return buckets;
+  }
+
+  private renderNewsWithFullFinanceBuckets(category: string, items: NewsItem[]): void {
+    this.renderNewsForCategory(category, items);
+    if (SITE_VARIANT !== 'full' || category !== 'finance') return;
+    const buckets = this.bucketFullFinanceNews(items);
+    for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+      if (key === 'finance') continue;
+      this.renderNewsForCategory(key, buckets[key]);
+    }
   }
 
   private async loadNewsCategory(category: string, feeds: typeof FEEDS.politics, digest?: ListFeedDigestResponse | null): Promise<NewsItem[]> {
@@ -565,9 +824,11 @@ export class DataLoaderManager implements AppModule {
 
       // Digest branch: server already aggregated feeds — map proto items to client types
       if (digest?.categories && category in digest.categories) {
-        let items = (digest.categories[category]?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledNames.has(i.source));
+        const digestItems = (digest.categories[category]?.items ?? [])
+          .map(protoItemToNewsItem);
+        const configuredNames = new Set((feeds ?? []).map((f) => f.name));
+        let items = digestItems.filter(i => enabledNames.has(i.source));
+        items = this.reconcileDigestSourceFilter(category, digestItems, items, configuredNames);
 
         ingestHeadlines(items.map(i => ({ title: i.title, pubDate: i.pubDate, source: i.source, link: i.link })));
 
@@ -587,7 +848,7 @@ export class DataLoaderManager implements AppModule {
 
         checkBatchForBreakingAlerts(items);
         this.flashMapForNews(items);
-        this.renderNewsForCategory(category, items);
+        this.renderNewsWithFullFinanceBuckets(category, items);
 
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
@@ -608,9 +869,11 @@ export class DataLoaderManager implements AppModule {
       // Digest branch: server already aggregated feeds — map proto items to client types
       if (digest?.categories && category in digest.categories) {
         const enabledNames = new Set(enabledFeeds.map(f => f.name));
-        let items = (digest.categories[category]?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledNames.has(i.source));
+        const digestItems = (digest.categories[category]?.items ?? [])
+          .map(protoItemToNewsItem);
+        const configuredNames = new Set((feeds ?? []).map((f) => f.name));
+        let items = digestItems.filter(i => enabledNames.has(i.source));
+        items = this.reconcileDigestSourceFilter(category, digestItems, items, configuredNames);
 
         ingestHeadlines(items.map(i => ({ title: i.title, pubDate: i.pubDate, source: i.source, link: i.link })));
 
@@ -630,7 +893,7 @@ export class DataLoaderManager implements AppModule {
 
         checkBatchForBreakingAlerts(items);
         this.flashMapForNews(items);
-        this.renderNewsForCategory(category, items);
+        this.renderNewsWithFullFinanceBuckets(category, items);
 
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
@@ -685,7 +948,7 @@ export class DataLoaderManager implements AppModule {
       const staleItems = this.getStaleNewsItems(category).filter(i => enabledNames.has(i.source));
       if (staleItems.length > 0) {
         console.warn(`[News] Digest missing for "${category}", serving stale headlines (${staleItems.length})`);
-        this.renderNewsForCategory(category, staleItems);
+        this.renderNewsWithFullFinanceBuckets(category, staleItems);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'ok',
           itemCount: staleItems.length,
@@ -695,7 +958,7 @@ export class DataLoaderManager implements AppModule {
 
       if (!this.isPerFeedFallbackEnabled()) {
         console.warn(`[News] Digest missing for "${category}", limited per-feed fallback disabled`);
-        this.renderNewsForCategory(category, []);
+        this.renderNewsWithFullFinanceBuckets(category, []);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
           status: 'error',
           errorMessage: 'Digest unavailable',
@@ -719,7 +982,7 @@ export class DataLoaderManager implements AppModule {
         },
       });
 
-      this.renderNewsForCategory(category, items);
+      this.renderNewsWithFullFinanceBuckets(category, items);
       if (panel) {
         if (renderTimeout) {
           clearTimeout(renderTimeout);
@@ -757,6 +1020,11 @@ export class DataLoaderManager implements AppModule {
       });
       this.ctx.statusPanel?.updateApi('RSS2JSON', { status: 'error' });
       delete this.ctx.newsByCategory[category];
+      if (SITE_VARIANT === 'full' && category === 'finance') {
+        for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+          delete this.ctx.newsByCategory[key];
+        }
+      }
       return [];
     }
   }
@@ -815,9 +1083,11 @@ export class DataLoaderManager implements AppModule {
         this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: 0 });
       } else if (digest?.categories && 'intel' in digest.categories) {
         // Digest branch for intel
-        const intel = (digest.categories['intel']?.items ?? [])
-          .map(protoItemToNewsItem)
-          .filter(i => enabledIntelNames.has(i.source));
+        const digestIntel = (digest.categories['intel']?.items ?? [])
+          .map(protoItemToNewsItem);
+        let intel = digestIntel.filter(i => enabledIntelNames.has(i.source));
+        const intelConfiguredNames = new Set(enabledIntelSources.map((f) => f.name));
+        intel = this.reconcileDigestSourceFilter('intel', digestIntel, intel, intelConfiguredNames);
         checkBatchForBreakingAlerts(intel);
         this.renderNewsForCategory('intel', intel);
         if (intelPanel) {
@@ -828,6 +1098,7 @@ export class DataLoaderManager implements AppModule {
           } catch (e) { console.warn('[Baseline] news:intel write failed:', e); }
         }
         this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: intel.length });
+        dataFreshness.recordUpdate('gdelt', intel.length);
         collectedNews.push(...intel);
         this.flashMapForNews(intel);
       } else {
@@ -869,6 +1140,7 @@ export class DataLoaderManager implements AppModule {
               } catch (e) { console.warn('[Baseline] news:intel write failed:', e); }
             }
             this.ctx.statusPanel?.updateFeed('Intel', { status: 'ok', itemCount: intel.length });
+            dataFreshness.recordUpdate('gdelt', intel.length);
             collectedNews.push(...intel);
             this.flashMapForNews(intel);
           } else {
@@ -881,8 +1153,6 @@ export class DataLoaderManager implements AppModule {
 
     this.ctx.allNews = collectedNews;
     this.ctx.initialLoadComplete = true;
-    maybeShowDownloadBanner();
-    mountCommunityWidget();
     updateAndCheck([
       { type: 'news', region: 'global', count: collectedNews.length },
     ]).then(anomalies => {
@@ -902,10 +1172,8 @@ export class DataLoaderManager implements AppModule {
         ? await clusterNewsHybrid(this.ctx.allNews)
         : await analysisWorker.clusterNews(this.ctx.allNews);
 
-      if (this.ctx.latestClusters.length > 0) {
-        const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
-        insightsPanel?.updateInsights(this.ctx.latestClusters);
-      }
+      const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
+      insightsPanel?.updateInsights(this.ctx.latestClusters);
 
       const geoLocated = this.ctx.latestClusters
         .filter((c): c is typeof c & { lat: number; lon: number } => c.lat != null && c.lon != null)
@@ -921,6 +1189,12 @@ export class DataLoaderManager implements AppModule {
       }
     } catch (error) {
       console.error('[App] Clustering failed, clusters unchanged:', error);
+      const fallbackClusters = this.ctx.latestClusters.length > 0
+        ? this.ctx.latestClusters
+        : this.clusterNewsWithFallback(this.ctx.allNews);
+      this.ctx.latestClusters = fallbackClusters;
+      const insightsPanel = this.ctx.panels['insights'] as InsightsPanel | undefined;
+      insightsPanel?.updateInsights(fallbackClusters);
     }
 
     // Happy variant: run multi-stage positive news pipeline + map layers
@@ -1017,6 +1291,12 @@ export class DataLoaderManager implements AppModule {
     } catch {
       this.ctx.statusPanel?.updateApi('CoinGecko', { status: 'error' });
     }
+  }
+
+  async loadTimelineBriefs(): Promise<void> {
+    const panel = this.ctx.panels['timeline-briefs'] as TimelineBriefsPanel | undefined;
+    if (!panel) return;
+    await panel.fetchData();
   }
 
   async loadPredictions(): Promise<void> {
@@ -1171,8 +1451,8 @@ export class DataLoaderManager implements AppModule {
         signalAggregator.ingestProtests(protestData.events);
         const protestCount = protestData.sources.acled + protestData.sources.gdelt;
         if (protestCount > 0) dataFreshness.recordUpdate('acled', protestCount);
-        if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
-        if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+        dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+        dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
         if (this.ctx.mapLayers.protests) {
           this.ctx.map?.setProtests(protestData.events);
           this.ctx.map?.setLayerReady('protests', protestData.events.length > 0);
@@ -1380,7 +1660,9 @@ export class DataLoaderManager implements AppModule {
           this.ctx.intelligenceCache.orefAlerts = { alertCount: updAlerts, historyCount24h: updHistory };
           if (update.alerts?.length) dispatchOrefBreakingAlert(update.alerts);
         });
-        startOrefPolling();
+        if (!MANUAL_REFRESH_ONLY) {
+          startOrefPolling();
+        }
       } catch (error) {
         console.error('[Intelligence] OREF alerts fetch failed:', error);
       }
@@ -1625,7 +1907,8 @@ export class DataLoaderManager implements AppModule {
         this.ctx.statusPanel?.updateApi('ACLED', { status: 'warning' });
       }
       this.ctx.statusPanel?.updateApi('GDELT Doc', { status: 'ok' });
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
       return;
     }
     try {
@@ -1638,8 +1921,8 @@ export class DataLoaderManager implements AppModule {
       signalAggregator.ingestProtests(protestData.events);
       const protestCount = protestData.sources.acled + protestData.sources.gdelt;
       if (protestCount > 0) dataFreshness.recordUpdate('acled', protestCount);
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
-      if (protestData.sources.gdelt > 0) dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt', protestData.sources.gdelt);
+      dataFreshness.recordUpdate('gdelt_doc', protestData.sources.gdelt);
       (this.ctx.panels['cii'] as CIIPanel)?.refresh();
       const status = getProtestStatus();
       this.ctx.statusPanel?.updateFeed('Protests', {
@@ -1790,6 +2073,12 @@ export class DataLoaderManager implements AppModule {
 
   async loadFredData(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
+    if (!isFeatureAvailable('economicFred')) {
+      economicPanel?.showConfigError('FRED_API_KEY not configured — add in Settings');
+      economicPanel?.setErrorState(true, 'FRED_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
+      return;
+    }
     const cbInfo = getCircuitBreakerCooldownInfo('FRED Economic');
     if (cbInfo.onCooldown) {
       economicPanel?.setErrorState(true, `Temporarily unavailable (retry in ${cbInfo.remainingSeconds}s)`);
@@ -1856,6 +2145,13 @@ export class DataLoaderManager implements AppModule {
 
   async loadOilAnalytics(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
+    if (!isFeatureAvailable('energyEia')) {
+      economicPanel?.showConfigError('EIA_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('EIA', { status: 'error' });
+      dataFreshness.recordError('oil', 'EIA_API_KEY not configured — add in Settings');
+      economicPanel?.setLoading(false);
+      return;
+    }
     try {
       const data = await fetchOilAnalytics();
       economicPanel?.updateOil(data);
@@ -1912,6 +2208,12 @@ export class DataLoaderManager implements AppModule {
   async loadTradePolicy(): Promise<void> {
     const tradePanel = this.ctx.panels['trade-policy'] as TradePolicyPanel | undefined;
     if (!tradePanel) return;
+    if (!isFeatureAvailable('wtoTrade')) {
+      tradePanel.showConfigError('WTO_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('WTO', { status: 'error' });
+      dataFreshness.recordError('wto_trade', 'WTO_API_KEY not configured — add in Settings');
+      return;
+    }
 
     try {
       const [restrictions, tariffs, flows, barriers] = await Promise.all([
@@ -1946,6 +2248,12 @@ export class DataLoaderManager implements AppModule {
   async loadSupplyChain(): Promise<void> {
     const scPanel = this.ctx.panels['supply-chain'] as SupplyChainPanel | undefined;
     if (!scPanel) return;
+    if (!isFeatureAvailable('supplyChain')) {
+      scPanel.showConfigError('FRED_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('SupplyChain', { status: 'error' });
+      dataFreshness.recordError('supply_chain', 'FRED_API_KEY not configured — add in Settings');
+      return;
+    }
 
     try {
       const [shipping, chokepoints, minerals] = await Promise.allSettled([
@@ -2022,6 +2330,11 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadFirmsData(): Promise<void> {
+    if (!isFeatureAvailable('nasaFirms')) {
+      this.ctx.panels['satellite-fires']?.showConfigError('NASA_FIRMS_API_KEY not configured — add in Settings');
+      this.ctx.statusPanel?.updateApi('FIRMS', { status: 'error' });
+      return;
+    }
     try {
       const fireResult = await fetchAllFires(1);
       if (fireResult.skipped) {
@@ -2277,11 +2590,19 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadTelegramIntel(): Promise<void> {
+    if (Date.now() < this.telegramPollingPausedUntil) return;
     try {
       const result = await fetchTelegramFeed();
       (this.ctx.panels['telegram-intel'] as TelegramIntelPanel)?.setData(result);
     } catch (error) {
       console.error('[App] Telegram intel fetch failed:', error);
+      const message = String(error ?? '');
+      if (/not configured|missing/i.test(message)) {
+        (this.ctx.panels['telegram-intel'] as TelegramIntelPanel | undefined)
+          ?.showConfigError('Telegram relay API not configured — add WS_RELAY_URL in Settings');
+        this.telegramPollingPausedUntil = Date.now() + 30 * 60 * 1000;
+        console.warn('[App] Telegram intel polling paused for 30 minutes due to missing configuration');
+      }
     }
   }
 }

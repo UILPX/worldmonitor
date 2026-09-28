@@ -948,6 +948,36 @@ test('does not soft-pass provider auth 403 JSON responses even with cf-ray heade
   }
 });
 
+test('verifies OpenAI key via /api/local-validate-secret', async () => {
+  const localApi = await setupApiDir({});
+  const restoreHttps = mockHttpsRequestOnce({
+    statusCode: 200,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ object: 'list', data: [{ id: 'gpt-4o-mini' }] }),
+  });
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+
+  try {
+    const response = await postJsonViaHttp(`http://127.0.0.1:${port}/api/local-validate-secret`, {
+      key: 'OPENAI_API_KEY',
+      value: 'dummy-key',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.json?.valid, true);
+    assert.equal(response.json?.message, 'OpenAI key verified');
+  } finally {
+    restoreHttps();
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
 test('auth-required behavior unchanged — rejects unauthenticated requests when token is set', async () => {
   const localApi = await setupApiDir({});
   const originalToken = process.env.LOCAL_API_TOKEN;

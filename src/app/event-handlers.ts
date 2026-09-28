@@ -69,6 +69,8 @@ export class EventHandlerManager implements AppModule {
   private idleTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private snapshotIntervalId: ReturnType<typeof setInterval> | null = null;
   private clockIntervalId: ReturnType<typeof setInterval> | null = null;
+  private manualRefreshArmed = false;
+  private manualRefreshArmTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private readonly IDLE_PAUSE_MS = 2 * 60 * 1000;
   private debouncedUrlSync = debounce(() => {
     const shareUrl = this.getShareUrl();
@@ -163,6 +165,11 @@ export class EventHandlerManager implements AppModule {
       clearInterval(this.clockIntervalId);
       this.clockIntervalId = null;
     }
+    if (this.manualRefreshArmTimeoutId) {
+      clearTimeout(this.manualRefreshArmTimeoutId);
+      this.manualRefreshArmTimeoutId = null;
+    }
+    this.manualRefreshArmed = false;
     this.ctx.tvMode?.destroy();
     this.ctx.tvMode = null;
     this.ctx.unifiedSettings?.destroy();
@@ -187,6 +194,9 @@ export class EventHandlerManager implements AppModule {
         this.setCopyLinkFeedback(button, 'Copy failed');
       }
     });
+
+    this.setupManualRefreshButton();
+    this.setupDiscussionModal();
 
     window.addEventListener('storage', (e) => {
       if (e.key === STORAGE_KEYS.panels && e.newValue) {
@@ -385,6 +395,110 @@ export class EventHandlerManager implements AppModule {
     }, 1500);
   }
 
+  private setupManualRefreshButton(): void {
+    const button = document.getElementById('manualRefreshBtn') as HTMLButtonElement | null;
+    if (!button) return;
+    const defaultLabel = button.textContent || t('common.refresh');
+
+    const disarm = () => {
+      this.manualRefreshArmed = false;
+      button.classList.remove('armed');
+      button.textContent = defaultLabel;
+      if (this.manualRefreshArmTimeoutId) {
+        clearTimeout(this.manualRefreshArmTimeoutId);
+        this.manualRefreshArmTimeoutId = null;
+      }
+    };
+
+    button.addEventListener('click', async () => {
+      if (button.dataset.loading === '1') return;
+
+      if (!this.manualRefreshArmed) {
+        this.manualRefreshArmed = true;
+        button.classList.add('armed');
+        button.textContent = `${defaultLabel}?`;
+        if (this.manualRefreshArmTimeoutId) {
+          clearTimeout(this.manualRefreshArmTimeoutId);
+        }
+        this.manualRefreshArmTimeoutId = setTimeout(() => disarm(), 4000);
+        this.showToast('Click refresh again to confirm');
+        return;
+      }
+
+      disarm();
+      button.dataset.loading = '1';
+      button.disabled = true;
+      button.textContent = 'Refreshing...';
+
+      try {
+        await this.callbacks.loadAllData();
+        await this.refreshManuallyLoadedPanels();
+        this.showToast('Refresh complete');
+      } catch (error) {
+        console.warn('[Manual Refresh] failed:', error);
+        this.showToast('Refresh failed');
+      } finally {
+        button.dataset.loading = '0';
+        button.disabled = false;
+        button.textContent = defaultLabel;
+      }
+    });
+  }
+
+  private async refreshManuallyLoadedPanels(): Promise<void> {
+    const panelTasks: Array<Promise<unknown>> = [];
+
+    const serviceStatusPanel = this.ctx.panels['service-status'] as unknown as { fetchStatus?: () => Promise<unknown> } | undefined;
+    if (serviceStatusPanel?.fetchStatus) panelTasks.push(serviceStatusPanel.fetchStatus());
+
+    const macroSignalsPanel = this.ctx.panels['macro-signals'] as unknown as { fetchData?: () => Promise<unknown> } | undefined;
+    if (macroSignalsPanel?.fetchData) panelTasks.push(macroSignalsPanel.fetchData());
+
+    const etfFlowsPanel = this.ctx.panels['etf-flows'] as unknown as { fetchData?: () => Promise<unknown> } | undefined;
+    if (etfFlowsPanel?.fetchData) panelTasks.push(etfFlowsPanel.fetchData());
+
+    const stablecoinsPanel = this.ctx.panels['stablecoins'] as unknown as { fetchData?: () => Promise<unknown> } | undefined;
+    if (stablecoinsPanel?.fetchData) panelTasks.push(stablecoinsPanel.fetchData());
+
+    const gulfEconomiesPanel = this.ctx.panels['gulf-economies'] as unknown as { fetchData?: () => Promise<unknown> } | undefined;
+    if (gulfEconomiesPanel?.fetchData) panelTasks.push(gulfEconomiesPanel.fetchData());
+
+    if (panelTasks.length > 0) {
+      await Promise.allSettled(panelTasks);
+    }
+  }
+
+  private setupDiscussionModal(): void {
+    const openButton = document.getElementById('discussionBtn');
+    const overlay = document.getElementById('discussionModal');
+    if (!openButton || !overlay) return;
+
+    const closeButton = document.getElementById('discussionModalClose');
+    const dismissButton = document.getElementById('discussionDismissBtn');
+
+    const closeModal = () => {
+      overlay.classList.remove('active');
+      overlay.setAttribute('aria-hidden', 'true');
+    };
+
+    const openModal = () => {
+      overlay.classList.add('active');
+      overlay.setAttribute('aria-hidden', 'false');
+    };
+
+    openButton.addEventListener('click', openModal);
+    closeButton?.addEventListener('click', closeModal);
+    dismissButton?.addEventListener('click', closeModal);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) closeModal();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && overlay.classList.contains('active')) {
+        closeModal();
+      }
+    });
+  }
+
   toggleFullscreen(): void {
     if (document.fullscreenElement) {
       try { void document.exitFullscreen()?.catch(() => {}); } catch {}
@@ -467,6 +581,15 @@ export class EventHandlerManager implements AppModule {
           saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
           this.applyPanelSettings();
         }
+      },
+      resetLayout: () => {
+        const confirmed = window.confirm('Restore default panel order and size? This will reload the page.');
+        if (!confirmed) return;
+        localStorage.removeItem(this.ctx.PANEL_ORDER_KEY);
+        localStorage.removeItem(this.ctx.PANEL_SPANS_KEY);
+        localStorage.removeItem('worldmonitor-panel-col-spans');
+        localStorage.removeItem('map-height');
+        window.location.reload();
       },
       getDisabledSources: () => this.ctx.disabledSources,
       toggleSource: (name: string) => {

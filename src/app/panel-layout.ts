@@ -18,6 +18,8 @@ import {
   CascadePanel,
   StrategicRiskPanel,
   StrategicPosturePanel,
+  TimelineBriefsPanel,
+  RecentEventsQAPanel,
   TechEventsPanel,
   ServiceStatusPanel,
   RuntimeConfigPanel,
@@ -58,6 +60,18 @@ import {
   STORAGE_KEYS,
   SITE_VARIANT,
 } from '@/config';
+import {
+  REGIONAL_NEWS_FEED_KEYS,
+  REGIONAL_NEWS_SELECTION_STORAGE_KEY,
+  REGIONAL_NEWS_SELECTION_EVENT,
+  FULL_FINANCE_NEWS_FEED_KEYS,
+  DEFAULT_FULL_FINANCE_NEWS_FEED_KEY,
+  FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY,
+  FULL_FINANCE_NEWS_SELECTION_EVENT,
+  inferRegionalNewsFeedFromView,
+  type RegionalNewsFeedKey,
+  type FullFinanceNewsFeedKey,
+} from '@/config/feeds';
 import { BETA_MODE } from '@/config/beta';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
@@ -154,13 +168,6 @@ export class PanelLayoutManager implements AppModule {
             </a>` : ''}`;
           })()}</div>
           <span class="logo">MONITOR</span><span class="version">v${__APP_VERSION__}</span>${BETA_MODE ? '<span class="beta-badge">BETA</span>' : ''}
-          <a href="https://x.com/eliehabib" target="_blank" rel="noopener" class="credit-link">
-            <svg class="x-logo" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
-            <span class="credit-text">@eliehabib</span>
-          </a>
-          <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener" class="github-link" title="${t('header.viewOnGitHub')}">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-          </a>
           <div class="status-indicator">
             <span class="status-dot"></span>
             <span>${t('header.live')}</span>
@@ -180,6 +187,8 @@ export class PanelLayoutManager implements AppModule {
         </div>
         <div class="header-right">
           <!-- TODO: Add "Download App" link here for non-desktop users (this.ctx.isDesktopApp === false) -->
+          <button class="copy-link-btn manual-refresh-btn" id="manualRefreshBtn">${t('common.refresh')}</button>
+          <button class="copy-link-btn discussion-btn" id="discussionBtn">${t('components.community.openDiscussion')}</button>
           <button class="search-btn" id="searchBtn"><kbd>⌘K</kbd> ${t('header.search')}</button>
           ${this.ctx.isDesktopApp ? '' : `<button class="copy-link-btn" id="copyLinkBtn">${t('header.copyLink')}</button>`}
           <button class="theme-toggle-btn" id="headerThemeToggle" title="${t('header.toggleTheme')}">
@@ -216,6 +225,24 @@ export class PanelLayoutManager implements AppModule {
         </div>
         <div class="panels-grid" id="panelsGrid"></div>
       </div>
+      <div class="discussion-modal-overlay" id="discussionModal" aria-hidden="true">
+        <div class="discussion-modal" role="dialog" aria-modal="true" aria-labelledby="discussionModalTitle">
+          <div class="discussion-modal-header">
+            <h2 id="discussionModalTitle" class="discussion-modal-title">${t('components.community.joinDiscussion')}</h2>
+            <button class="discussion-modal-close" id="discussionModalClose" aria-label="${t('common.close')}">×</button>
+          </div>
+          <p class="discussion-modal-copy">Share feedback, API setup tips, and module ideas with the community.</p>
+          <div class="discussion-modal-actions">
+            <a
+              class="discussion-modal-open"
+              href="https://github.com/koala73/worldmonitor/discussions"
+              target="_blank"
+              rel="noopener"
+            >${t('components.community.openDiscussion')}</a>
+            <button class="discussion-modal-dismiss" id="discussionDismissBtn">${t('common.close')}</button>
+          </div>
+        </div>
+      </div>
     `;
 
     this.createPanels();
@@ -249,6 +276,157 @@ export class PanelLayoutManager implements AppModule {
       localStorage.setItem('mobile-map-collapsed', String(isCollapsed));
       if (!isCollapsed) window.dispatchEvent(new Event('resize'));
     });
+  }
+
+  private getRegionalNewsLabel(category: RegionalNewsFeedKey): string {
+    const labelMap: Record<RegionalNewsFeedKey, string> = {
+      us: t('panels.us'),
+      europe: t('panels.europe'),
+      middleeast: t('panels.middleeast'),
+      africa: t('panels.africa'),
+      latam: t('panels.latam'),
+      asia: t('panels.asia'),
+    };
+    return labelMap[category];
+  }
+
+  private getSelectedRegionalNewsCategory(): RegionalNewsFeedKey {
+    const stored = localStorage.getItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && REGIONAL_NEWS_FEED_KEYS.includes(stored as RegionalNewsFeedKey)) {
+      return stored as RegionalNewsFeedKey;
+    }
+    return inferRegionalNewsFeedFromView(this.ctx.resolvedLocation);
+  }
+
+  private setRegionalNewsPanelTitle(panel: NewsPanel, _category: RegionalNewsFeedKey): void {
+    const titleEl = panel.getElement().querySelector('.panel-title');
+    if (!titleEl) return;
+    titleEl.textContent = t('panels.regionalNews');
+  }
+
+  private renderSelectedRegionalNews(panel: NewsPanel): void {
+    const category = this.getSelectedRegionalNewsCategory();
+    if (!(category in this.ctx.newsByCategory)) {
+      panel.showLoading();
+      return;
+    }
+    const items = this.ctx.newsByCategory[category] ?? [];
+    const filtered = this.filterItemsByTimeRange(items);
+    if (filtered.length === 0 && items.length > 0) {
+      panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
+      return;
+    }
+    panel.renderNews(filtered);
+  }
+
+  private setupRegionalNewsSelector(panel: NewsPanel): void {
+    const headerLeft = panel.getElement().querySelector('.panel-header-left');
+    if (!headerLeft) return;
+
+    if (!localStorage.getItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY)) {
+      localStorage.setItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY, inferRegionalNewsFeedFromView(this.ctx.resolvedLocation));
+    }
+
+    const category = this.getSelectedRegionalNewsCategory();
+    this.setRegionalNewsPanelTitle(panel, category);
+
+    const select = document.createElement('select');
+    select.className = 'region-select regional-news-select';
+    select.title = t('components.regionalNews.selectRegion');
+
+    for (const key of REGIONAL_NEWS_FEED_KEYS) {
+      const option = document.createElement('option');
+      option.value = key;
+      option.textContent = this.getRegionalNewsLabel(key);
+      select.appendChild(option);
+    }
+
+    select.value = category;
+    select.addEventListener('change', () => {
+      const next = select.value as RegionalNewsFeedKey;
+      if (!REGIONAL_NEWS_FEED_KEYS.includes(next)) return;
+      localStorage.setItem(REGIONAL_NEWS_SELECTION_STORAGE_KEY, next);
+      this.setRegionalNewsPanelTitle(panel, next);
+      this.renderSelectedRegionalNews(panel);
+      window.dispatchEvent(new CustomEvent(REGIONAL_NEWS_SELECTION_EVENT, { detail: { category: next } }));
+    });
+
+    headerLeft.appendChild(select);
+  }
+
+  private getFullFinanceNewsLabel(category: FullFinanceNewsFeedKey): string {
+    const labelMap: Record<FullFinanceNewsFeedKey, string> = {
+      finance: t('panels.finance'),
+      markets: t('panels.markets'),
+      commodities: t('panels.commodities'),
+      crypto: t('panels.crypto'),
+      economic: t('panels.economic'),
+    };
+    return labelMap[category];
+  }
+
+  private getSelectedFullFinanceNewsCategory(): FullFinanceNewsFeedKey {
+    const stored = localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY);
+    if (stored && FULL_FINANCE_NEWS_FEED_KEYS.includes(stored as FullFinanceNewsFeedKey)) {
+      return stored as FullFinanceNewsFeedKey;
+    }
+    return DEFAULT_FULL_FINANCE_NEWS_FEED_KEY;
+  }
+
+  private setFullFinanceNewsPanelTitle(panel: NewsPanel, _category: FullFinanceNewsFeedKey): void {
+    const titleEl = panel.getElement().querySelector('.panel-title');
+    if (!titleEl) return;
+    titleEl.textContent = t('panels.finance');
+  }
+
+  private renderSelectedFullFinanceNews(panel: NewsPanel): void {
+    const category = this.getSelectedFullFinanceNewsCategory();
+    if (!(category in this.ctx.newsByCategory)) {
+      panel.showLoading();
+      return;
+    }
+    const items = this.ctx.newsByCategory[category] ?? [];
+    const filtered = this.filterItemsByTimeRange(items);
+    if (filtered.length === 0 && items.length > 0) {
+      panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
+      return;
+    }
+    panel.renderNews(filtered);
+  }
+
+  private setupFullFinanceNewsSelector(panel: NewsPanel): void {
+    const headerLeft = panel.getElement().querySelector('.panel-header-left');
+    if (!headerLeft) return;
+
+    if (!localStorage.getItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY)) {
+      localStorage.setItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY, DEFAULT_FULL_FINANCE_NEWS_FEED_KEY);
+    }
+
+    const category = this.getSelectedFullFinanceNewsCategory();
+    this.setFullFinanceNewsPanelTitle(panel, category);
+
+    const select = document.createElement('select');
+    select.className = 'region-select finance-news-select';
+    select.title = t('panels.finance');
+
+    for (const key of FULL_FINANCE_NEWS_FEED_KEYS) {
+      const option = document.createElement('option');
+      option.value = key;
+      option.textContent = this.getFullFinanceNewsLabel(key);
+      select.appendChild(option);
+    }
+
+    select.value = category;
+    select.addEventListener('change', () => {
+      const next = select.value as FullFinanceNewsFeedKey;
+      if (!FULL_FINANCE_NEWS_FEED_KEYS.includes(next)) return;
+      localStorage.setItem(FULL_FINANCE_NEWS_SELECTION_STORAGE_KEY, next);
+      this.setFullFinanceNewsPanelTitle(panel, next);
+      this.renderSelectedFullFinanceNews(panel);
+      window.dispatchEvent(new CustomEvent(FULL_FINANCE_NEWS_SELECTION_EVENT, { detail: { category: next } }));
+    });
+
+    headerLeft.appendChild(select);
   }
 
   renderCriticalBanner(postures: TheaterPostureSummary[]): void {
@@ -349,10 +527,21 @@ export class PanelLayoutManager implements AppModule {
     this.ctx.map.initEscalationGetters();
     this.ctx.currentTimeRange = this.ctx.map.getTimeRange();
 
-    const politicsPanel = new NewsPanel('politics', t('panels.politics'));
-    this.attachRelatedAssetHandlers(politicsPanel);
-    this.ctx.newsPanels['politics'] = politicsPanel;
-    this.ctx.panels['politics'] = politicsPanel;
+    if (SITE_VARIANT === 'full') {
+      const politicsPanel = new NewsPanel('politics', t('panels.politics'));
+      this.attachRelatedAssetHandlers(politicsPanel);
+      this.ctx.newsPanels['politics'] = politicsPanel;
+      this.ctx.panels['politics'] = politicsPanel;
+
+      const regionalNewsPanel = new NewsPanel('regional-news', t('panels.regionalNews'));
+      regionalNewsPanel.getElement().classList.add('panel-default-span-2');
+      this.attachRelatedAssetHandlers(regionalNewsPanel);
+      this.ctx.panels['regional-news'] = regionalNewsPanel;
+      for (const category of REGIONAL_NEWS_FEED_KEYS) {
+        this.ctx.newsPanels[category] = regionalNewsPanel;
+      }
+      this.setupRegionalNewsSelector(regionalNewsPanel);
+    }
 
     const techPanel = new NewsPanel('tech', t('panels.tech'));
     this.attachRelatedAssetHandlers(techPanel);
@@ -363,6 +552,12 @@ export class PanelLayoutManager implements AppModule {
     this.attachRelatedAssetHandlers(financePanel);
     this.ctx.newsPanels['finance'] = financePanel;
     this.ctx.panels['finance'] = financePanel;
+    if (SITE_VARIANT === 'full') {
+      for (const category of FULL_FINANCE_NEWS_FEED_KEYS) {
+        this.ctx.newsPanels[category] = financePanel;
+      }
+      this.setupFullFinanceNewsSelector(financePanel);
+    }
 
     const heatmapPanel = new HeatmapPanel();
     this.ctx.panels['heatmap'] = heatmapPanel;
@@ -396,11 +591,6 @@ export class PanelLayoutManager implements AppModule {
 
     const cryptoPanel = new CryptoPanel();
     this.ctx.panels['crypto'] = cryptoPanel;
-
-    const middleeastPanel = new NewsPanel('middleeast', t('panels.middleeast'));
-    this.attachRelatedAssetHandlers(middleeastPanel);
-    this.ctx.newsPanels['middleeast'] = middleeastPanel;
-    this.ctx.panels['middleeast'] = middleeastPanel;
 
     const layoffsPanel = new NewsPanel('layoffs', t('panels.layoffs'));
     this.attachRelatedAssetHandlers(layoffsPanel);
@@ -498,21 +688,6 @@ export class PanelLayoutManager implements AppModule {
       this.ctx.panels['supply-chain'] = supplyChainPanel;
     }
 
-    const africaPanel = new NewsPanel('africa', t('panels.africa'));
-    this.attachRelatedAssetHandlers(africaPanel);
-    this.ctx.newsPanels['africa'] = africaPanel;
-    this.ctx.panels['africa'] = africaPanel;
-
-    const latamPanel = new NewsPanel('latam', t('panels.latam'));
-    this.attachRelatedAssetHandlers(latamPanel);
-    this.ctx.newsPanels['latam'] = latamPanel;
-    this.ctx.panels['latam'] = latamPanel;
-
-    const asiaPanel = new NewsPanel('asia', t('panels.asia'));
-    this.attachRelatedAssetHandlers(asiaPanel);
-    this.ctx.newsPanels['asia'] = asiaPanel;
-    this.ctx.panels['asia'] = asiaPanel;
-
     const energyPanel = new NewsPanel('energy', t('panels.energy'));
     this.attachRelatedAssetHandlers(energyPanel);
     this.ctx.newsPanels['energy'] = energyPanel;
@@ -534,6 +709,12 @@ export class PanelLayoutManager implements AppModule {
     if (SITE_VARIANT === 'full') {
       const gdeltIntelPanel = new GdeltIntelPanel();
       this.ctx.panels['gdelt-intel'] = gdeltIntelPanel;
+
+      const timelineBriefsPanel = new TimelineBriefsPanel();
+      this.ctx.panels['timeline-briefs'] = timelineBriefsPanel;
+
+      const recentEventsQAPanel = new RecentEventsQAPanel();
+      this.ctx.panels['recent-events-qa'] = recentEventsQAPanel;
 
       if (this.ctx.isDesktopApp) {
         import('@/components/DeductionPanel').then(({ DeductionPanel }) => {
@@ -687,8 +868,24 @@ export class PanelLayoutManager implements AppModule {
       const valid = savedOrder.filter(k => defaultOrder.includes(k));
       const monitorsIdx = valid.indexOf('monitors');
       if (monitorsIdx !== -1) valid.splice(monitorsIdx, 1);
-      const insertIdx = valid.indexOf('politics') + 1 || 0;
+      const regionalNewsIdx = valid.indexOf('regional-news');
+      const insertIdx = regionalNewsIdx >= 0 ? regionalNewsIdx + 1 : 0;
       const newPanels = missing.filter(k => k !== 'monitors');
+      const timelineIdx = newPanels.indexOf('timeline-briefs');
+      if (timelineIdx !== -1) {
+        newPanels.splice(timelineIdx, 1);
+        const liveNewsIdx = valid.indexOf('live-news');
+        const timelineInsertIdx = liveNewsIdx >= 0 ? liveNewsIdx + 1 : 0;
+        valid.splice(timelineInsertIdx, 0, 'timeline-briefs');
+      }
+      const recentQaIdx = newPanels.indexOf('recent-events-qa');
+      if (recentQaIdx !== -1) {
+        newPanels.splice(recentQaIdx, 1);
+        const timelineInsertIdx = valid.indexOf('timeline-briefs');
+        const liveNewsIdx = valid.indexOf('live-news');
+        const recentQaInsertIdx = timelineInsertIdx >= 0 ? timelineInsertIdx + 1 : (liveNewsIdx >= 0 ? liveNewsIdx + 1 : 0);
+        valid.splice(recentQaInsertIdx, 0, 'recent-events-qa');
+      }
       valid.splice(insertIdx, 0, ...newPanels);
       if (SITE_VARIANT !== 'happy') {
         valid.push('monitors');
@@ -697,18 +894,15 @@ export class PanelLayoutManager implements AppModule {
     }
 
     if (SITE_VARIANT !== 'happy') {
-      const liveNewsIdx = panelOrder.indexOf('live-news');
-      if (liveNewsIdx > 0) {
-        panelOrder.splice(liveNewsIdx, 1);
-        panelOrder.unshift('live-news');
+      const preferredTopOrder = ['live-news', 'live-webcams', 'timeline-briefs', 'recent-events-qa', 'telegram-intel'];
+      const top: string[] = [];
+      for (const panelId of preferredTopOrder) {
+        if (panelOrder.includes(panelId) && !top.includes(panelId)) {
+          top.push(panelId);
+        }
       }
-
-      const webcamsIdx = panelOrder.indexOf('live-webcams');
-      if (webcamsIdx !== -1 && webcamsIdx !== panelOrder.indexOf('live-news') + 1) {
-        panelOrder.splice(webcamsIdx, 1);
-        const afterNews = panelOrder.indexOf('live-news') + 1;
-        panelOrder.splice(afterNews, 0, 'live-webcams');
-      }
+      const rest = panelOrder.filter((panelId) => !top.includes(panelId));
+      panelOrder = [...top, ...rest];
     }
 
     if (this.ctx.isDesktopApp) {
@@ -740,15 +934,31 @@ export class PanelLayoutManager implements AppModule {
   }
 
   private applyTimeRangeFilterToNewsPanels(): void {
+    const selectedRegionalCategory = this.getSelectedRegionalNewsCategory();
+    const selectedFullFinanceCategory = this.getSelectedFullFinanceNewsCategory();
+    const renderedPanels = new Set<NewsPanel>();
     Object.entries(this.ctx.newsByCategory).forEach(([category, items]) => {
       const panel = this.ctx.newsPanels[category];
       if (!panel) return;
+      if (renderedPanels.has(panel)) return;
+      if (REGIONAL_NEWS_FEED_KEYS.includes(category as RegionalNewsFeedKey) && category !== selectedRegionalCategory) {
+        return;
+      }
+      if (
+        SITE_VARIANT === 'full' &&
+        FULL_FINANCE_NEWS_FEED_KEYS.includes(category as FullFinanceNewsFeedKey) &&
+        category !== selectedFullFinanceCategory
+      ) {
+        return;
+      }
       const filtered = this.filterItemsByTimeRange(items);
       if (filtered.length === 0 && items.length > 0) {
         panel.renderFilteredEmpty(`No items in ${this.getTimeRangeLabel()}`);
+        renderedPanels.add(panel);
         return;
       }
       panel.renderNews(filtered);
+      renderedPanels.add(panel);
     });
   }
 

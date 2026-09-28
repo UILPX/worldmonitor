@@ -17,6 +17,20 @@ interface ApiStatus {
   latency?: number;
 }
 
+const DEBUG_LOCAL_STORAGE_KEYS = [
+  'worldmonitor-variant',
+  'panel-order',
+  'worldmonitor-panel-spans',
+  'worldmonitor-panel-col-spans',
+  'worldmonitor-panels',
+  'worldmonitor-layers',
+  'worldmonitor-disabled-feeds',
+  'worldmonitor-live-channels',
+  'map-height',
+  'map-pinned',
+  'worldmonitor-request-mode',
+] as const;
+
 // Allowlists for each variant
 const TECH_FEEDS = new Set([
   'Tech', 'Ai', 'Startups', 'Vcblogs', 'RegionalStartups',
@@ -85,7 +99,14 @@ export class StatusPanel extends Panel {
         ),
       ),
       h('div', { className: 'status-panel-footer' },
-        h('span', { className: 'last-check' }, t('components.status.updatedJustNow')),
+        h('div', { className: 'status-panel-actions' },
+          h('button', {
+            type: 'button',
+            className: 'status-panel-action-btn',
+            onClick: () => { void this.exportDebugReport(); },
+          }, 'Export Debug Report'),
+        ),
+        h('span', { className: 'last-check' }, t('components.status.updatedAt', { time: this.formatTime(new Date()) })),
       ),
     );
 
@@ -233,11 +254,100 @@ export class StatusPanel extends Panel {
   }
 
   private formatTime(date: Date): string {
-    const now = Date.now();
-    const diff = now - date.getTime();
-    if (diff < 60000) return 'just now';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleString();
+  }
+
+  private parseStoredValue(raw: string | null): unknown {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  private readDebugLocalStorage(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const key of DEBUG_LOCAL_STORAGE_KEYS) {
+      out[key] = this.parseStoredValue(localStorage.getItem(key));
+    }
+    return out;
+  }
+
+  private async getStorageEstimateForDebug(): Promise<{ usageBytes: number | null; quotaBytes: number | null }> {
+    try {
+      if (!('storage' in navigator) || !('estimate' in navigator.storage)) {
+        return { usageBytes: null, quotaBytes: null };
+      }
+      const estimate = await navigator.storage.estimate();
+      return {
+        usageBytes: typeof estimate.usage === 'number' ? estimate.usage : null,
+        quotaBytes: typeof estimate.quota === 'number' ? estimate.quota : null,
+      };
+    } catch {
+      return { usageBytes: null, quotaBytes: null };
+    }
+  }
+
+  private async buildDebugReport(): Promise<Record<string, unknown>> {
+    const feeds = [...this.feeds.values()].map((feed) => ({
+      ...feed,
+      lastUpdate: feed.lastUpdate ? feed.lastUpdate.toISOString() : null,
+    }));
+    const apis = [...this.apis.values()];
+    const storageEstimate = await this.getStorageEstimateForDebug();
+
+    return {
+      exportedAt: new Date().toISOString(),
+      variant: SITE_VARIANT,
+      page: {
+        href: window.location.href,
+        origin: window.location.origin,
+        pathname: window.location.pathname,
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        online: navigator.onLine,
+      },
+      storage: storageEstimate,
+      status: {
+        feeds,
+        apis,
+      },
+      localStorage: this.readDebugLocalStorage(),
+    };
+  }
+
+  private async exportDebugReport(): Promise<void> {
+    const exportedAt = new Date();
+    try {
+      const payload = await this.buildDebugReport();
+      const fileTime = exportedAt.toISOString().replace(/[:.]/g, '-');
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `worldmonitor-debug-${fileTime}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+
+      const lastCheck = this.element.querySelector('.last-check');
+      if (lastCheck) {
+        lastCheck.textContent = `${t('components.status.updatedAt', { time: this.formatTime(new Date()) })} · Debug report exported`;
+      }
+    } catch (error) {
+      console.error('[StatusPanel] Failed to export debug report', error);
+      const lastCheck = this.element.querySelector('.last-check');
+      if (lastCheck) {
+        lastCheck.textContent = `${t('components.status.updatedAt', { time: this.formatTime(new Date()) })} · Export failed`;
+      }
+    }
   }
 
   public getElement(): HTMLElement {

@@ -6,7 +6,6 @@ import { getChangeClass, formatChange, formatOilValue, getTrendIndicator, getTre
 import { formatAwardAmount, getAwardTypeIcon } from '@/services/usa-spending';
 import { escapeHtml } from '@/utils/sanitize';
 import { isFeatureAvailable } from '@/services/runtime-config';
-import { isDesktopRuntime } from '@/services/runtime';
 import { getCSSColor } from '@/utils';
 
 type TabId = 'indicators' | 'oil' | 'spending' | 'centralBanks';
@@ -130,7 +129,7 @@ export class EconomicPanel extends Panel {
 
   private renderIndicators(): string {
     if (this.fredData.length === 0) {
-      if (isDesktopRuntime() && !isFeatureAvailable('economicFred')) {
+      if (!isFeatureAvailable('economicFred')) {
         return `<div class="economic-empty">${t('components.economic.fredKeyMissing')}</div>`;
       }
       return `<div class="economic-empty">${t('components.economic.noIndicatorData')}</div>`;
@@ -164,6 +163,10 @@ export class EconomicPanel extends Panel {
   }
 
   private renderOil(): string {
+    if (!isFeatureAvailable('energyEia')) {
+      return `<div class="economic-empty">${t('components.economic.eiaKeyMissing')}</div>`;
+    }
+
     if (!this.oilData) {
       return `<div class="economic-empty">${t('components.economic.noOilDataRetry')}</div>`;
     }

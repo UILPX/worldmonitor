@@ -1,6 +1,7 @@
 import type { RuntimeSecretKey, RuntimeFeatureId } from './runtime-config';
 
 export const SIGNUP_URLS: Partial<Record<RuntimeSecretKey, string>> = {
+  OPENAI_API_KEY: 'https://platform.openai.com/api-keys',
   GROQ_API_KEY: 'https://console.groq.com/keys',
   OPENROUTER_API_KEY: 'https://openrouter.ai/settings/keys',
   FRED_API_KEY: 'https://fred.stlouisfed.org/docs/api/api_key.html',
@@ -34,6 +35,7 @@ export const PLAINTEXT_KEYS = new Set<RuntimeSecretKey>([
 export const MASKED_SENTINEL = '__WM_MASKED__';
 
 export const HUMAN_LABELS: Record<RuntimeSecretKey, string> = {
+  OPENAI_API_KEY: 'OpenAI API Key',
   GROQ_API_KEY: 'Groq API Key',
   OPENROUTER_API_KEY: 'OpenRouter API Key',
   FRED_API_KEY: 'FRED API Key',
@@ -70,7 +72,7 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
   {
     id: 'ai',
     label: 'AI & Summarization',
-    features: ['aiOllama', 'aiGroq', 'aiOpenRouter'],
+    features: ['aiOllama', 'aiOpenAI', 'aiGroq', 'aiOpenRouter'],
   },
   {
     id: 'economy',

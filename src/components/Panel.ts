@@ -168,7 +168,11 @@ export class Panel {
   protected newBadgeEl: HTMLElement | null = null;
   protected panelId: string;
   private abortController: AbortController = new AbortController();
-  private tooltipCloseHandler: (() => void) | null = null;
+  private tooltipCloseHandler: ((event: MouseEvent) => void) | null = null;
+  private tooltipViewportHandler: (() => void) | null = null;
+  private tooltipViewportListenersAttached = false;
+  private infoTooltipEl: HTMLDivElement | null = null;
+  private infoTooltipBtn: HTMLButtonElement | null = null;
   private resizeHandle: HTMLElement | null = null;
   private isResizing = false;
   private startY = 0;
@@ -213,23 +217,40 @@ export class Panel {
     headerLeft.appendChild(title);
 
     if (options.infoTooltip) {
-      const infoBtn = h('button', { className: 'panel-info-btn', 'aria-label': t('components.panel.showMethodologyInfo') }, '?');
+      const infoBtn = h('button', {
+        className: 'panel-info-btn',
+        type: 'button',
+        'aria-label': t('components.panel.showMethodologyInfo'),
+        'aria-haspopup': 'dialog',
+        'aria-expanded': 'false',
+      }, '?') as HTMLButtonElement;
 
-      const tooltip = h('div', { className: 'panel-info-tooltip' });
+      const tooltip = h('div', { className: 'panel-info-tooltip', role: 'dialog' }) as HTMLDivElement;
       tooltip.appendChild(safeHtml(options.infoTooltip));
+      this.infoTooltipEl = tooltip;
+      this.infoTooltipBtn = infoBtn;
+      this.ensureInfoTooltipMounted();
 
       infoBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        tooltip.classList.toggle('visible');
+        this.toggleInfoTooltip();
       });
 
-      this.tooltipCloseHandler = () => tooltip.classList.remove('visible');
+      this.tooltipCloseHandler = (event: MouseEvent) => {
+        const target = event.target as Node | null;
+        if (!target || !this.infoTooltipEl?.classList.contains('visible')) return;
+        if (this.infoTooltipEl.contains(target) || this.infoTooltipBtn?.contains(target)) return;
+        this.hideInfoTooltip();
+      };
       document.addEventListener('click', this.tooltipCloseHandler);
+
+      this.tooltipViewportHandler = () => {
+        this.positionInfoTooltip();
+      };
 
       const infoWrapper = document.createElement('div');
       infoWrapper.className = 'panel-info-wrapper';
       infoWrapper.appendChild(infoBtn);
-      infoWrapper.appendChild(tooltip);
       headerLeft.appendChild(infoWrapper);
     }
 
@@ -597,6 +618,86 @@ export class Panel {
     this.onColTouchCancel = this.onColTouchEnd;
   }
 
+  private ensureInfoTooltipMounted(): void {
+    if (!this.infoTooltipEl) return;
+    if (!this.infoTooltipEl.isConnected && document.body) {
+      document.body.appendChild(this.infoTooltipEl);
+    }
+  }
+
+  private toggleInfoTooltip(): void {
+    if (!this.infoTooltipEl) return;
+    if (this.infoTooltipEl.classList.contains('visible')) {
+      this.hideInfoTooltip();
+      return;
+    }
+    this.showInfoTooltip();
+  }
+
+  private showInfoTooltip(): void {
+    if (!this.infoTooltipEl || !this.infoTooltipBtn) return;
+    this.ensureInfoTooltipMounted();
+    this.infoTooltipEl.classList.add('visible');
+    this.element.classList.add('panel-tooltip-open');
+    this.infoTooltipBtn.setAttribute('aria-expanded', 'true');
+    this.positionInfoTooltip();
+
+    if (this.tooltipViewportHandler && !this.tooltipViewportListenersAttached) {
+      window.addEventListener('resize', this.tooltipViewportHandler, { passive: true });
+      window.addEventListener('scroll', this.tooltipViewportHandler, true);
+      this.tooltipViewportListenersAttached = true;
+    }
+  }
+
+  private hideInfoTooltip(): void {
+    if (!this.infoTooltipEl || !this.infoTooltipBtn) return;
+    this.infoTooltipEl.classList.remove('visible', 'tooltip-above');
+    this.element.classList.remove('panel-tooltip-open');
+    this.infoTooltipBtn.setAttribute('aria-expanded', 'false');
+    if (this.tooltipViewportHandler && this.tooltipViewportListenersAttached) {
+      window.removeEventListener('resize', this.tooltipViewportHandler);
+      window.removeEventListener('scroll', this.tooltipViewportHandler, true);
+      this.tooltipViewportListenersAttached = false;
+    }
+  }
+
+  private positionInfoTooltip(): void {
+    if (!this.infoTooltipEl || !this.infoTooltipBtn) return;
+    if (!this.infoTooltipEl.classList.contains('visible')) return;
+
+    const buttonRect = this.infoTooltipBtn.getBoundingClientRect();
+    const tooltipRect = this.infoTooltipEl.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const gutter = 8;
+    const arrowSafeInset = 12;
+    const tooltipWidth = tooltipRect.width;
+    const tooltipHeight = tooltipRect.height;
+
+    let left = buttonRect.left + buttonRect.width / 2 - tooltipWidth / 2;
+    left = Math.max(gutter, Math.min(left, viewportWidth - tooltipWidth - gutter));
+
+    let top = buttonRect.bottom + gutter;
+    let placeAbove = false;
+    const aboveTop = buttonRect.top - tooltipHeight - gutter;
+
+    if (top + tooltipHeight > viewportHeight - gutter && aboveTop >= gutter) {
+      top = aboveTop;
+      placeAbove = true;
+    } else if (top + tooltipHeight > viewportHeight - gutter) {
+      top = Math.max(gutter, viewportHeight - tooltipHeight - gutter);
+    }
+
+    const arrowMax = Math.max(arrowSafeInset, tooltipWidth - arrowSafeInset);
+    const arrowXRaw = buttonRect.left + buttonRect.width / 2 - left;
+    const arrowX = Math.max(arrowSafeInset, Math.min(arrowXRaw, arrowMax));
+
+    this.infoTooltipEl.style.left = `${Math.round(left)}px`;
+    this.infoTooltipEl.style.top = `${Math.round(top)}px`;
+    this.infoTooltipEl.style.setProperty('--panel-tooltip-arrow-x', `${Math.round(arrowX)}px`);
+    this.infoTooltipEl.classList.toggle('tooltip-above', placeAbove);
+  }
+
 
   protected setDataBadge(state: 'live' | 'cached' | 'unavailable', detail?: string): void {
     if (!this.statusBadgeEl) return;
@@ -797,6 +898,15 @@ export class Panel {
       this.contentDebounceTimer = null;
     }
     this.pendingContentHtml = null;
+
+    this.hideInfoTooltip();
+    if (this.infoTooltipEl?.isConnected) {
+      this.infoTooltipEl.remove();
+    }
+    this.infoTooltipEl = null;
+    this.infoTooltipBtn = null;
+    this.tooltipViewportHandler = null;
+    this.tooltipViewportListenersAttached = false;
 
     if (this.tooltipCloseHandler) {
       document.removeEventListener('click', this.tooltipCloseHandler);

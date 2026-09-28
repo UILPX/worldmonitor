@@ -10,7 +10,7 @@ import { isMobileDevice } from '@/utils';
 import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
 import { SITE_VARIANT } from '@/config';
 import { deletePersistentCache, getPersistentCache, setPersistentCache } from '@/services/persistent-cache';
-import { t } from '@/services/i18n';
+import { getCurrentLanguage, t } from '@/services/i18n';
 import { isDesktopRuntime } from '@/services/runtime';
 import { getAiFlowSettings, isAnyAiProviderEnabled, subscribeAiFlowChange } from '@/services/ai-flow-settings';
 import type { ClusteredEvent, FocalPoint, MilitaryFlight } from '@/types';
@@ -27,7 +27,7 @@ export class InsightsPanel extends Panel {
   private aiFlowUnsubscribe: (() => void) | null = null;
   private updateGeneration = 0;
   private static readonly BRIEF_COOLDOWN_MS = 120000; // 2 min cooldown (API has limits)
-  private static readonly BRIEF_CACHE_KEY = 'summary:world-brief';
+  private static readonly BRIEF_CACHE_KEY = 'summary:world-brief:v2';
 
   constructor() {
     super({
@@ -380,7 +380,7 @@ export class InsightsPanel extends Panel {
         const result = await generateSummary(titles, (_step, _total, msg) => {
           // Show sub-progress for summarization
           this.setProgress(3, totalSteps, `Generating brief: ${msg}`);
-        }, geoContext, undefined, summarizeOpts);
+        }, geoContext, getCurrentLanguage(), summarizeOpts);
 
         if (this.updateGeneration !== thisGeneration) return;
 

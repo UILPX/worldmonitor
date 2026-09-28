@@ -3,6 +3,7 @@ node_modules/
 dist/
 .DS_Store
 *.log
+worldmonitor-*-amd64.tar
 .env
 .env.local
 .playwright-mcp/
@@ -44,3 +45,8 @@ scripts/data/osm-military-raw.json
 # Iran events seed script + data (sensitive, not for public repo)
 scripts/seed-iran-events.mjs
 scripts/data/iran-events-latest.json
+tmp/relay-cache/notam.v1.json
+tmp/relay-cache/opensky.v1.json
+tmp/relay-cache/ucdp.v1.json
+tmp/relay-cache/polymarket.v1.json
+tmp/relay-cache/worldbank.v1.json

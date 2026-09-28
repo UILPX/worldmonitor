@@ -136,10 +136,7 @@ export class PizzIntIndicator {
   }
 
   private formatTimeAgo(date: Date): string {
-    const diff = Date.now() - date.getTime();
-    if (diff < 60000) return t('components.pizzint.justNow');
-    if (diff < 3600000) return t('components.pizzint.minutesAgo', { m: String(Math.floor(diff / 60000)) });
-    return t('components.pizzint.hoursAgo', { h: String(Math.floor(diff / 3600000)) });
+    return date.toLocaleString();
   }
 
   private getDefconLabel(level: number): string {

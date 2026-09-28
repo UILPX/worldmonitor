@@ -792,14 +792,7 @@ export class MapPopup {
   }
 
   private getTimeAgo(date: Date): string {
-    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-    if (seconds < 60) return t('popups.timeAgo.s', { count: seconds });
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return t('popups.timeAgo.m', { count: minutes });
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return t('popups.timeAgo.h', { count: hours });
-    const days = Math.floor(hours / 24);
-    return t('popups.timeAgo.d', { count: days });
+    return date.toLocaleString();
   }
 
   private renderWeatherPopup(alert: WeatherAlert): string {

@@ -1,6 +1,7 @@
 import { Panel } from './Panel';
-import { sanitizeUrl } from '@/utils/sanitize';
-import { t } from '@/services/i18n';
+import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
+import { generateSummary } from '@/services/summarization';
+import { t, getCurrentLanguage } from '@/services/i18n';
 import { h, replaceChildren } from '@/utils/dom-utils';
 import {
   TELEGRAM_TOPICS,
@@ -14,6 +15,9 @@ export class TelegramIntelPanel extends Panel {
   private activeTopic = 'all';
   private tabsEl: HTMLElement | null = null;
   private relayEnabled = true;
+  private summaryBtn: HTMLButtonElement | null = null;
+  private summaryContainer: HTMLElement | null = null;
+  private isSummarizing = false;
 
   constructor() {
     super({
@@ -23,7 +27,9 @@ export class TelegramIntelPanel extends Panel {
       trackActivity: true,
       infoTooltip: t('components.telegramIntel.infoTooltip'),
     });
+    this.element.classList.add('panel-default-span-2');
     this.createTabs();
+    this.createSummarizeButton();
     this.showLoading(t('components.telegramIntel.loading'));
   }
 
@@ -43,6 +49,7 @@ export class TelegramIntelPanel extends Panel {
   private selectTopic(topicId: string): void {
     if (topicId === this.activeTopic) return;
     this.activeTopic = topicId;
+    this.hideSummary();
 
     this.tabsEl?.querySelectorAll('.telegram-intel-tab').forEach(tab => {
       tab.classList.toggle('active', (tab as HTMLElement).dataset.topicId === topicId);
@@ -51,12 +58,108 @@ export class TelegramIntelPanel extends Panel {
     this.renderItems();
   }
 
+  private createSummarizeButton(): void {
+    this.summaryContainer = document.createElement('div');
+    this.summaryContainer.className = 'panel-summary';
+    this.summaryContainer.style.display = 'none';
+    this.element.insertBefore(this.summaryContainer, this.content);
+
+    this.summaryBtn = document.createElement('button');
+    this.summaryBtn.className = 'panel-summarize-btn';
+    this.summaryBtn.innerHTML = '✨';
+    this.summaryBtn.title = t('components.newsPanel.summarize');
+    this.summaryBtn.addEventListener('click', () => void this.handleSummarize());
+
+    const countEl = this.header.querySelector('.panel-count');
+    if (countEl) {
+      this.header.insertBefore(this.summaryBtn, countEl);
+    } else {
+      this.header.appendChild(this.summaryBtn);
+    }
+  }
+
+  private getFilteredItems(): TelegramItem[] {
+    return this.activeTopic === 'all'
+      ? this.items
+      : this.items.filter(item => item.topic === this.activeTopic);
+  }
+
+  private updateSummaryButtonState(filtered: TelegramItem[]): void {
+    if (!this.summaryBtn) return;
+    const canSummarize = this.relayEnabled && filtered.length >= 2;
+    this.summaryBtn.disabled = !canSummarize || this.isSummarizing;
+    this.summaryBtn.style.display = this.relayEnabled ? '' : 'none';
+  }
+
+  private async handleSummarize(): Promise<void> {
+    if (!this.summaryBtn || !this.summaryContainer || this.isSummarizing) return;
+
+    const filtered = this.getFilteredItems();
+    if (filtered.length < 2) return;
+
+    this.isSummarizing = true;
+    this.summaryBtn.innerHTML = '<span class="panel-summarize-spinner"></span>';
+    this.summaryBtn.disabled = true;
+    this.summaryContainer.style.display = 'block';
+    this.summaryContainer.innerHTML = `<div class="panel-summary-loading">${t('components.newsPanel.generatingSummary')}</div>`;
+
+    try {
+      const headlines = filtered
+        .slice(0, 12)
+        .map((item) => `${item.channelTitle || item.channel}: ${item.text}`.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+
+      const summary = await generateSummary(
+        headlines,
+        undefined,
+        `Telegram OSINT feed (${this.activeTopic})`,
+        getCurrentLanguage(),
+      );
+
+      if (summary?.summary) {
+        this.showSummary(summary.summary);
+      } else {
+        this.summaryContainer.innerHTML = '<div class="panel-summary-error">Summary failed</div>';
+        setTimeout(() => this.hideSummary(), 3000);
+      }
+    } catch {
+      this.summaryContainer.innerHTML = '<div class="panel-summary-error">Summary failed</div>';
+      setTimeout(() => this.hideSummary(), 3000);
+    } finally {
+      this.isSummarizing = false;
+      if (this.summaryBtn) {
+        this.summaryBtn.innerHTML = '✨';
+      }
+      this.updateSummaryButtonState(this.getFilteredItems());
+    }
+  }
+
+  private showSummary(summary: string): void {
+    if (!this.summaryContainer) return;
+    this.summaryContainer.style.display = 'block';
+    this.summaryContainer.innerHTML = `
+      <div class="panel-summary-content">
+        <span class="panel-summary-text">${escapeHtml(summary)}</span>
+        <button class="panel-summary-close" title="${t('components.newsPanel.close')}">×</button>
+      </div>
+    `;
+    this.summaryContainer.querySelector('.panel-summary-close')?.addEventListener('click', () => this.hideSummary());
+  }
+
+  private hideSummary(): void {
+    if (!this.summaryContainer) return;
+    this.summaryContainer.style.display = 'none';
+    this.summaryContainer.innerHTML = '';
+  }
+
   public setData(response: TelegramFeedResponse): void {
     this.relayEnabled = response.enabled;
     this.items = response.items || [];
 
     if (!this.relayEnabled) {
       this.setCount(0);
+      this.updateSummaryButtonState([]);
+      this.hideSummary();
       replaceChildren(this.content,
         h('div', { className: 'empty-state' }, t('components.telegramIntel.disabled')),
       );
@@ -67,13 +170,13 @@ export class TelegramIntelPanel extends Panel {
   }
 
   private renderItems(): void {
-    const filtered = this.activeTopic === 'all'
-      ? this.items
-      : this.items.filter(item => item.topic === this.activeTopic);
+    const filtered = this.getFilteredItems();
 
     this.setCount(filtered.length);
+    this.updateSummaryButtonState(filtered);
 
     if (filtered.length === 0) {
+      this.hideSummary();
       replaceChildren(this.content,
         h('div', { className: 'empty-state' }, t('components.telegramIntel.empty')),
       );
@@ -113,6 +216,10 @@ export class TelegramIntelPanel extends Panel {
     if (this.tabsEl) {
       this.tabsEl.remove();
       this.tabsEl = null;
+    }
+    if (this.summaryContainer) {
+      this.summaryContainer.remove();
+      this.summaryContainer = null;
     }
     super.destroy();
   }

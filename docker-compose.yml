@@ -1,0 +1,49 @@
+services:
+  relay:
+    image: worldmonitor-app:local
+    platform: linux/amd64
+    container_name: worldmonitor-relay
+    working_dir: /app
+    command: node scripts/ais-relay.cjs
+    env_file:
+      - .env.local
+    environment:
+      PORT: "3004"
+      RELAY_DISK_CACHE_DIR: /app/tmp/relay-cache
+    ports:
+      - "3004:3004"
+    volumes:
+      - relay-cache:/app/tmp/relay-cache
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: worldmonitor-app:local
+    platform: linux/amd64
+    container_name: worldmonitor-web
+    working_dir: /app
+    command: vercel dev --yes --listen 0.0.0.0:3000
+    env_file:
+      - .env.local
+    environment:
+      # Server-side API functions in web container should call relay by service name.
+      WS_RELAY_URL: http://relay:3004
+      # Avoid Cloudflare/public-origin hairpin for internal API calls.
+      WORLDMONITOR_INTERNAL_BASE_URL: http://127.0.0.1:3000
+      # Browser should call relay via host-exposed ports.
+      VITE_WS_RELAY_URL: ws://localhost:3004
+      VITE_OPENSKY_RELAY_URL: http://localhost:3004
+    ports:
+      - "3000:3000"
+    depends_on:
+      - relay
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  relay-cache:

@@ -146,6 +146,8 @@
   },
   "panels": {
     "liveNews": "实时新闻",
+    "timelineBriefs": "AI时间线摘要",
+    "recentEventsQa": "AI近期事件问答",
     "markets": "市场",
     "map": "全球态势",
     "techMap": "全球科技",
@@ -158,6 +160,7 @@
     "intel": "情报动态",
     "gdeltIntel": "实时情报",
     "cascade": "基础设施级联",
+    "regionalNews": "地区新闻",
     "politics": "世界新闻",
     "us": "美国",
     "europe": "欧洲",
@@ -503,7 +506,47 @@
     }
   },
   "components": {
+    "regionalNews": {
+      "selectRegion": "选择地区"
+    },
+    "timelineBriefs": {
+      "tenMinutes": "10分钟摘要",
+      "oneHour": "1小时摘要",
+      "twelveHours": "12小时摘要",
+      "everyTenMinutes": "每10分钟",
+      "everyHour": "每个整点",
+      "nyTwiceDaily": "纽约时间 08:00 / 20:00",
+      "refreshTenMinutes": "立即刷新10分钟摘要（测试）",
+      "refreshTenMinutesShort": "10分↻",
+      "window": "时间窗口",
+      "updated": "更新时间",
+      "headlines": "头条数量",
+      "unavailable": "时间线摘要暂不可用"
+    },
+    "recentEventsQa": {
+      "placeholder": "询问最近发生了什么（Ctrl/Cmd + Enter 发送）",
+      "ask": "提问",
+      "asking": "正在提问...",
+      "empty": "输入问题后即可基于最近缓存事件生成回答。",
+      "failed": "问答请求失败，请稍后重试。",
+      "noProvider": "未配置可用的 AI 提供商。",
+      "minQuestion": "请至少输入 3 个字符。",
+      "rateLimited": "请求过于频繁，请在 {{seconds}} 秒后重试。",
+      "updated": "更新时间",
+      "window": "时间窗口",
+      "headlines": "使用头条数",
+      "contextChars": "上下文字符数",
+      "provider": "模型来源",
+      "hintCache": "上下文来自最近事件缓存",
+      "hintRateLimit": "同时限制全局频率和单访客频率",
+      "ready": "可用",
+      "infoTooltip": "可询问近期事件。回答仅基于站点缓存的最近新闻头条生成，并限制上下文大小和访问频率以保证稳定。"
+    },
     "webcams": {
+      "load": "加载监控",
+      "clickToLoad": "实时监控",
+      "paused": "监控已暂停",
+      "pausedIdle": "监控已暂停，移动鼠标可恢复",
       "regions": {
         "iran": "IRAN ATTACKS",
         "all": "全部",
@@ -564,6 +607,7 @@
       "noSpending": "无近期政府采购",
       "awards": "笔采购",
       "noIndicatorData": "尚无指标数据 - FRED可能正在加载",
+      "eiaKeyMissing": "需要EIA API密钥 — 请在设置中添加以启用石油分析",
       "noOilDataRetry": "石油数据暂时不可用 - 将自动重试",
       "vsPreviousWeek": "与上周相比",
       "in": "于",
@@ -1202,7 +1246,7 @@
       "infoTooltip": "来自监控的Telegram OSINT频道的实时信号",
       "loading": "正在连接Telegram中继...",
       "empty": "暂无消息",
-      "disabled": "Telegram中继未激活",
+      "disabled": "Telegram中继API未配置 — 请在设置中添加WS_RELAY_URL",
       "filterAll": "全部",
       "filterBreaking": "突发",
       "filterConflict": "冲突",
@@ -1339,6 +1383,8 @@
     },
     "liveNews": {
       "retry": "Retry",
+      "loadPlayer": "加载播放器",
+      "liveStreamLabel": "实时新闻",
       "notLive": "{{name}} is not currently live",
       "cannotEmbed": "{{name}} cannot be embedded in this app (YouTube {{code}})",
       "openOnYouTube": "Open on YouTube",

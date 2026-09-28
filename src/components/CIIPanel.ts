@@ -95,13 +95,13 @@ export class CIIPanel extends Panel {
   }
 
   public async refresh(forceLocal = false): Promise<void> {
-    if (!this.focalPointsReady && !forceLocal) {
-      return;
-    }
-
     if (forceLocal) {
       this.focalPointsReady = true;
       console.log('[CIIPanel] Focal points ready, calculating scores...');
+    } else if (!this.focalPointsReady) {
+      // Avoid indefinite loading when focal-point event is delayed/missing.
+      // We can still render baseline CII from currently ingested signals.
+      this.focalPointsReady = true;
     }
 
     this.showLoading();
