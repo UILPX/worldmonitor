@@ -1,8 +1,6 @@
 import { extractFinalAnswerFromReasoning, extractLlmResponseText } from './llm-content';
 declare const process: { env: Record<string, string | undefined> };
 
-const LOCAL_LLM_VERBOSE_LOGS = process.env.LOCAL_LLM_VERBOSE_LOGS === 'true';
-
 function isPrivateIpv4(hostname: string): boolean {
   const parts = hostname.split('.').map((p) => Number.parseInt(p, 10));
   if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
@@ -31,8 +29,6 @@ export function isLikelyLocalLlmUrl(rawUrl: string): boolean {
 }
 
 export function logLocalLlmRequest(scope: string, provider: string, apiUrl: string, model: string): void {
-  if (!LOCAL_LLM_VERBOSE_LOGS) return;
-  if (!isLikelyLocalLlmUrl(apiUrl)) return;
   try {
     const target = new URL(apiUrl);
     const endpoint = `${target.protocol}//${target.host}${target.pathname}`;
@@ -42,6 +38,47 @@ export function logLocalLlmRequest(scope: string, provider: string, apiUrl: stri
     const ts = new Date().toISOString();
     console.log(`[LocalLLM][${scope}] ${ts} request sent | provider=${provider} | model=${model}`);
   }
+}
+
+export function logLlmRawRequest(
+  scope: string,
+  provider: string,
+  apiUrl: string,
+  model: string,
+  payload: unknown,
+): void {
+  const ts = new Date().toISOString();
+  let body = '';
+  try {
+    body = JSON.stringify(payload);
+  } catch {
+    body = '[unserializable request payload]';
+  }
+  console.log(`[LocalLLM][${scope}] ${ts} request_raw | provider=${provider} | model=${model} | api=${apiUrl} | body=${body}`);
+}
+
+export function logLlmRawResponse(
+  scope: string,
+  provider: string,
+  apiUrl: string,
+  model: string,
+  status: number,
+  rawBody: string,
+): void {
+  const ts = new Date().toISOString();
+  console.log(`[LocalLLM][${scope}] ${ts} response_raw | provider=${provider} | model=${model} | api=${apiUrl} | status=${status} | body=${rawBody}`);
+}
+
+export function logLlmRawFetchError(
+  scope: string,
+  provider: string,
+  apiUrl: string,
+  model: string,
+  error: unknown,
+): void {
+  const ts = new Date().toISOString();
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.log(`[LocalLLM][${scope}] ${ts} response_raw | provider=${provider} | model=${model} | api=${apiUrl} | status=fetch_error | body=${message}`);
 }
 
 function compactText(raw: string, maxLen: number): string {

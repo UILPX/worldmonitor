@@ -80,6 +80,19 @@ const API_PROVIDERS: ApiProviderDef[] = [
 
 let lastAttemptedProvider = 'none';
 
+const OLLAMA_CHAIN_ATTEMPTS = 2;
+const OLLAMA_CHAIN_RETRY_DELAY_MS = 1200;
+
+function getProviderAttempts(provider: ApiProviderDef): number {
+  if (provider.provider !== 'ollama') return 1;
+  return OLLAMA_CHAIN_ATTEMPTS;
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ── Unified API provider caller (via SummarizeArticle RPC) ──
 
 async function tryApiProvider(
@@ -172,9 +185,16 @@ async function runApiChain(
   totalSteps: number,
 ): Promise<SummarizationResult | null> {
   for (const [i, provider] of providers.entries()) {
-    onProgress?.(stepOffset + i, totalSteps, `Connecting to ${provider.label}...`);
-    const result = await tryApiProvider(provider, headlines, geoContext, lang);
-    if (result) return result;
+    const attempts = getProviderAttempts(provider);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const suffix = attempts > 1 ? ` (${attempt}/${attempts})` : '';
+      onProgress?.(stepOffset + i, totalSteps, `Connecting to ${provider.label}${suffix}...`);
+      const result = await tryApiProvider(provider, headlines, geoContext, lang);
+      if (result) return result;
+      if (attempt < attempts) {
+        await sleepMs(OLLAMA_CHAIN_RETRY_DELAY_MS * attempt);
+      }
+    }
   }
   return null;
 }
@@ -303,28 +323,35 @@ export async function translateText(
   for (const [i, providerDef] of API_PROVIDERS.entries()) {
     if (!isFeatureAvailable(providerDef.featureId)) continue;
 
-    onProgress?.(i + 1, totalSteps, `Translating with ${providerDef.label}...`);
-    try {
-      const resp = await summaryBreakers[providerDef.provider].execute(async () => {
-        return newsClient.summarizeArticle({
-          provider: providerDef.provider,
-          headlines: [text],
-          mode: 'translate',
-          geoContext: '',
-          variant: targetLang,
-          lang: '',
-        });
-      }, emptySummaryFallback);
+    const attempts = getProviderAttempts(providerDef);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const suffix = attempts > 1 ? ` (${attempt}/${attempts})` : '';
+      onProgress?.(i + 1, totalSteps, `Translating with ${providerDef.label}${suffix}...`);
+      try {
+        const resp = await summaryBreakers[providerDef.provider].execute(async () => {
+          return newsClient.summarizeArticle({
+            provider: providerDef.provider,
+            headlines: [text],
+            mode: 'translate',
+            geoContext: '',
+            variant: targetLang,
+            lang: '',
+          });
+        }, emptySummaryFallback);
 
-      if (resp.fallback || resp.skipped) {
-        const reason = resp.reason || resp.error || 'no details';
-        console.warn(`[Summarization] ${providerDef.label} translation skipped/fallback: ${reason}`);
-        continue;
+        if (resp.fallback || resp.skipped) {
+          const reason = resp.reason || resp.error || 'no details';
+          console.warn(`[Summarization] ${providerDef.label} translation skipped/fallback: ${reason}`);
+        } else {
+          const summary = typeof resp.summary === 'string' ? resp.summary.trim() : '';
+          if (summary) return summary;
+        }
+      } catch (e) {
+        console.warn(`${providerDef.label} translation failed`, e);
       }
-      const summary = typeof resp.summary === 'string' ? resp.summary.trim() : '';
-      if (summary) return summary;
-    } catch (e) {
-      console.warn(`${providerDef.label} translation failed`, e);
+      if (attempt < attempts) {
+        await sleepMs(OLLAMA_CHAIN_RETRY_DELAY_MS * attempt);
+      }
     }
   }
 

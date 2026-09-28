@@ -6,9 +6,15 @@ import { validateApiKey } from './_api-key.js';
 import { checkRateLimit } from './_rate-limit.js';
 import { cachedFetchJson, getCachedJson, setCachedJson } from '../server/_shared/redis';
 import { CHROME_UA } from '../server/_shared/constants';
-import { logLocalLlmFailure, logLocalLlmRequest } from '../server/_shared/local-llm-log';
+import {
+  logLlmRawFetchError,
+  logLlmRawRequest,
+  logLlmRawResponse,
+  logLocalLlmFailure,
+  logLocalLlmRequest,
+} from '../server/_shared/local-llm-log';
 import { runWithLocalLlmQueue } from '../server/_shared/local-llm-queue';
-import { extractFinalAnswerFromReasoning, extractLlmResponseText } from '../server/_shared/llm-content';
+import { extractFinalAnswerFromReasoning, extractLlmResponseText, isLlmLengthFinish } from '../server/_shared/llm-content';
 import { buildApiBaseOrigins } from './_internal-api-origin';
 
 export const config = { runtime: 'edge' };
@@ -88,7 +94,7 @@ function isTimelineStartupGracePeriod(): boolean {
 function getProviderTimeoutMs(provider: ProviderConfig['id'], period: BriefPeriod): number {
   const inStartupGrace = isTimelineStartupGracePeriod();
   if (provider === 'ollama') {
-    const defaultByPeriod = period === '12h' ? 120_000 : period === '1h' ? 90_000 : 60_000;
+    const defaultByPeriod = period === '12h' ? 75_000 : period === '1h' ? 60_000 : 45_000;
     const base = parsePositiveInt(process.env.TIMELINE_OLLAMA_TIMEOUT_MS)
       ?? parsePositiveInt(process.env.OLLAMA_TIMEOUT_MS)
       ?? defaultByPeriod;
@@ -129,6 +135,21 @@ function getTimelineCompletionLimit(provider: ProviderConfig['id'], model: strin
     return parsePositiveInt(process.env.TIMELINE_OPENAI_MAX_COMPLETION_TOKENS) ?? 420;
   }
   return parsePositiveInt(process.env.TIMELINE_MAX_TOKENS) ?? 180;
+}
+
+function getTimelineOllamaProviderAttempts(): number {
+  return parsePositiveInt(process.env.TIMELINE_OLLAMA_PROVIDER_ATTEMPTS)
+    ?? parsePositiveInt(process.env.OLLAMA_PROVIDER_ATTEMPTS)
+    ?? 2;
+}
+
+function getTimelineOllamaRetryDelayMs(): number {
+  return parsePositiveInt(process.env.TIMELINE_OLLAMA_PROVIDER_RETRY_DELAY_MS) ?? 1200;
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function usesMaxCompletionTokens(provider: ProviderConfig['id'], model: string): boolean {
@@ -511,14 +532,9 @@ function stripReasoningBlocks(raw: string): string {
   return out;
 }
 
-function getOllamaNoThinkPrefix(): string {
-  return '/set nothink\n';
-}
-
 function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
   return [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: getOllamaNoThinkPrefix().trim() },
     { role: 'user', content: userPrompt },
   ];
 }
@@ -576,28 +592,27 @@ async function summarizeHeadlines(
     throw new Error('No AI provider configured');
   }
   const prompts = buildPrompts(headlines, period, startMs, endMs, outputLang);
-  const deadline = Date.now() + getTimelineTotalTimeoutMs(period);
+  let deadline = 0;
 
   let lastError = 'Unknown AI error';
   for (const provider of providers) {
-    try {
-      const invokeProvider = async (): Promise<{ summary: string; provider: string; model: string }> => {
+    const invokeProvider = async (): Promise<{ summary: string; provider: string; model: string }> => {
         const buildBody = (completionLimit: number) => {
           return {
-          model: provider.model,
-          messages: provider.id === 'ollama'
-            ? buildOllamaChatMessages(prompts.system, prompts.user)
-            : [
-              { role: 'system', content: prompts.system },
-              { role: 'user', content: prompts.user },
-            ],
-          ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
-          ...(completionLimit > 0
-            ? (usesMaxCompletionTokens(provider.id, provider.model)
-              ? { max_completion_tokens: completionLimit }
-              : { max_tokens: completionLimit })
-            : {}),
-          ...(provider.extraBody || {}),
+            model: provider.model,
+            messages: provider.id === 'ollama'
+              ? buildOllamaChatMessages(prompts.system, prompts.user)
+              : [
+                { role: 'system', content: prompts.system },
+                { role: 'user', content: prompts.user },
+              ],
+            ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
+            ...(completionLimit > 0
+              ? (usesMaxCompletionTokens(provider.id, provider.model)
+                ? { max_completion_tokens: completionLimit }
+                : { max_tokens: completionLimit })
+              : {}),
+            ...(provider.extraBody || {}),
           };
         };
 
@@ -605,23 +620,39 @@ async function summarizeHeadlines(
           requestBody: Record<string, unknown>,
           logScope: 'timeline-briefs' | 'timeline-briefs-retry',
         ): Promise<any> => {
+          if (deadline <= 0) {
+            deadline = Date.now() + getTimelineTotalTimeoutMs(period);
+          }
           const remainingMs = deadline - Date.now();
           if (remainingMs <= 800) {
             throw new Error('timeline llm budget exceeded');
           }
 
           logLocalLlmRequest(logScope, provider.id, provider.apiUrl, provider.model);
-          const resp = await fetch(provider.apiUrl, {
-            method: 'POST',
-            headers: { ...provider.headers, 'User-Agent': CHROME_UA },
-            body: JSON.stringify(requestBody),
-            signal: AbortSignal.timeout(Math.min(getProviderTimeoutMs(provider.id, period), remainingMs)),
-          });
+          logLlmRawRequest(logScope, provider.id, provider.apiUrl, provider.model, requestBody);
+          let resp: Response;
+          try {
+            resp = await fetch(provider.apiUrl, {
+              method: 'POST',
+              headers: { ...provider.headers, 'User-Agent': CHROME_UA },
+              body: JSON.stringify(requestBody),
+              signal: AbortSignal.timeout(Math.min(getProviderTimeoutMs(provider.id, period), remainingMs)),
+            });
+          } catch (error) {
+            logLlmRawFetchError(logScope, provider.id, provider.apiUrl, provider.model, error);
+            throw error;
+          }
+          const rawBody = await resp.text();
+          logLlmRawResponse(logScope, provider.id, provider.apiUrl, provider.model, resp.status, rawBody);
 
           if (!resp.ok) {
             throw new Error(`${provider.id} HTTP ${resp.status}`);
           }
-          return await resp.json() as any;
+          try {
+            return JSON.parse(rawBody) as any;
+          } catch {
+            throw new Error(`${provider.id} invalid JSON response`);
+          }
         };
 
         const completionLimit = getTimelineCompletionLimit(provider.id, provider.model);
@@ -645,12 +676,27 @@ async function summarizeHeadlines(
           content = stripReasoningBlocks(content);
         }
 
-        if ((!content || content.length < 20) && isOpenAiReasoningModel) {
-          const retryLimit = Math.min(
-            1200,
-            Math.max(completionLimit + 200, Math.floor(completionLimit * 2)),
+        if ((!content || content.length < 20) && isOpenAiReasoningModel && isLlmLengthFinish(data)) {
+          const firstRetryLimit = Math.min(
+            1800,
+            Math.max(completionLimit + 400, Math.floor(completionLimit * 3)),
           );
-          data = await callProvider(buildBody(retryLimit), 'timeline-briefs-retry');
+          data = await callProvider(buildBody(firstRetryLimit), 'timeline-briefs-retry');
+          content = extractLlmResponseText(data).trim();
+          if (!content && provider.id === 'ollama') {
+            content = extractFinalAnswerFromReasoning(data).trim();
+          }
+          if (provider.id === 'ollama') {
+            content = stripReasoningBlocks(content);
+          }
+        }
+
+        if ((!content || content.length < 20) && isOpenAiReasoningModel && isLlmLengthFinish(data)) {
+          const secondRetryLimit = Math.min(
+            3000,
+            Math.max(completionLimit + 1200, Math.floor(completionLimit * 5)),
+          );
+          data = await callProvider(buildBody(secondRetryLimit), 'timeline-briefs-retry');
           content = extractLlmResponseText(data).trim();
           if (!content && provider.id === 'ollama') {
             content = extractFinalAnswerFromReasoning(data).trim();
@@ -700,14 +746,27 @@ async function summarizeHeadlines(
           model: provider.model,
         };
       };
-
-      if (provider.id === 'ollama') {
-        return await runWithLocalLlmQueue('timeline-briefs', invokeProvider);
+    const providerAttempts = provider.id === 'ollama' ? getTimelineOllamaProviderAttempts() : 1;
+    for (let attempt = 1; attempt <= providerAttempts; attempt += 1) {
+      try {
+        if (provider.id === 'ollama') {
+          return await runWithLocalLlmQueue('timeline-briefs', invokeProvider);
+        }
+        return await invokeProvider();
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (provider.id !== 'ollama' || attempt >= providerAttempts) {
+          break;
+        }
+        const remainingMs = deadline - Date.now();
+        const retryDelayMs = Math.min(
+          getTimelineOllamaRetryDelayMs() * attempt,
+          Math.max(0, remainingMs - 1200),
+        );
+        if (retryDelayMs > 0) {
+          await sleepMs(retryDelayMs);
+        }
       }
-
-      return await invokeProvider();
-    } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -869,20 +928,13 @@ export default async function handler(req: Request): Promise<Response> {
     const forceTenMinutes = requestUrl.searchParams.get('forceTenMinutes') === '1';
     const onlyTenMinutes = requestUrl.searchParams.get('only') === '10m';
     const refreshLongWindows = requestUrl.searchParams.get('refreshLong') === '1';
-    const inStartupGrace = isTimelineStartupGracePeriod();
-    const hasLocalOllama = Boolean(process.env.OLLAMA_API_URL);
-    const hasOpenAi = Boolean(process.env.OPENAI_API_KEY) && !OPENAI_PROVIDER_DISABLED;
-    const hasCloudLlm = Boolean(hasOpenAi || process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY);
-    const cacheLongWindowsOnlyByDefault = hasLocalOllama && !hasCloudLlm;
+    const explicitLongWindowCacheMode = (
+      requestUrl.searchParams.get('longWindows') === 'cache'
+      || process.env.TIMELINE_CACHE_LONG_WINDOWS_ONLY === 'true'
+    );
     const cacheLongWindowsOnly = (
       !refreshLongWindows
-      && (
-        inStartupGrace
-        ||
-        requestUrl.searchParams.get('longWindows') === 'cache'
-        || process.env.TIMELINE_CACHE_LONG_WINDOWS_ONLY === 'true'
-        || cacheLongWindowsOnlyByDefault
-      )
+      && explicitLongWindowCacheMode
     );
     const origins = buildApiBaseOrigins(req);
     const nowMs = Date.now();

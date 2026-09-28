@@ -13,7 +13,13 @@ import {
   getCacheKey,
 } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
-import { logLocalLlmFailure, logLocalLlmRequest } from '../../../_shared/local-llm-log';
+import {
+  logLlmRawFetchError,
+  logLlmRawRequest,
+  logLlmRawResponse,
+  logLocalLlmFailure,
+  logLocalLlmRequest,
+} from '../../../_shared/local-llm-log';
 import { runWithLocalLlmQueue } from '../../../_shared/local-llm-queue';
 import { extractFinalAnswerFromReasoning, extractLlmResponseText, isLlmLengthFinish } from '../../../_shared/llm-content';
 
@@ -90,7 +96,7 @@ function parsePositiveInt(raw: string | undefined): number | null {
 
 function getProviderTimeoutMs(provider: string, mode: string): number {
   if (provider === 'ollama') {
-    const modeDefault = mode === 'analysis' ? 180_000 : 120_000;
+    const modeDefault = mode === 'analysis' ? 60_000 : 45_000;
     return parsePositiveInt(process.env.OLLAMA_TIMEOUT_MS) ?? modeDefault;
   }
   return parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? 30_000;
@@ -108,14 +114,9 @@ function getCompletionLimit(provider: string, model: string): number {
   return parsePositiveInt(process.env.SUMMARIZE_MAX_TOKENS) ?? 120;
 }
 
-function getOllamaNoThinkPrefix(): string {
-  return '/set nothink\n';
-}
-
 function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
   return [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: getOllamaNoThinkPrefix().trim() },
     { role: 'user', content: userPrompt },
   ];
 }
@@ -264,15 +265,24 @@ export async function summarizeArticle(
             logScope: 'summarize-article' | 'summarize-article-retry',
           ): Promise<{ content: string; tokens: number; payload: unknown }> => {
             logLocalLlmRequest(logScope, provider, apiUrl, model);
-            let response = await fetch(apiUrl, {
-              method: 'POST',
-              headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
-              body: JSON.stringify(payload),
-              signal: AbortSignal.timeout(getProviderTimeoutMs(provider, mode)),
-            });
+            logLlmRawRequest(logScope, provider, apiUrl, model, payload);
+            let response: Response;
+            try {
+              response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(getProviderTimeoutMs(provider, mode)),
+              });
+            } catch (error) {
+              logLlmRawFetchError(logScope, provider, apiUrl, model, error);
+              throw error;
+            }
+            let rawBody = await response.text();
+            logLlmRawResponse(logScope, provider, apiUrl, model, response.status, rawBody);
 
             if (!response.ok) {
-              let errorText = await response.text();
+              let errorText = rawBody;
 
               // OpenAI compatibility fallback for models that require max_completion_tokens.
               const shouldRetryWithCompletionTokens = (
@@ -294,16 +304,24 @@ export async function summarizeArticle(
                   ...(completionLimit > 0 ? buildTokenLimit(provider, model, completionLimit) : {}),
                 };
                 logLocalLlmRequest('summarize-article-retry', provider, apiUrl, model);
-                response = await fetch(apiUrl, {
-                  method: 'POST',
-                  headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
-                  body: JSON.stringify(retryPayload),
-                  signal: AbortSignal.timeout(getProviderTimeoutMs(provider, mode)),
-                });
+                logLlmRawRequest('summarize-article-retry', provider, apiUrl, model, retryPayload);
+                try {
+                  response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
+                    body: JSON.stringify(retryPayload),
+                    signal: AbortSignal.timeout(getProviderTimeoutMs(provider, mode)),
+                  });
+                } catch (error) {
+                  logLlmRawFetchError('summarize-article-retry', provider, apiUrl, model, error);
+                  throw error;
+                }
+                rawBody = await response.text();
+                logLlmRawResponse('summarize-article-retry', provider, apiUrl, model, response.status, rawBody);
                 if (response.ok) {
                   errorText = '';
                 } else {
-                  errorText = await response.text();
+                  errorText = rawBody;
                 }
               }
 
@@ -321,7 +339,12 @@ export async function summarizeArticle(
               }
             }
 
-            const data = await response.json() as any;
+            let data: any;
+            try {
+              data = JSON.parse(rawBody) as any;
+            } catch {
+              throw new Error(`${provider} invalid JSON response`);
+            }
             return parseResponseContent(data);
           };
 
@@ -344,7 +367,7 @@ export async function summarizeArticle(
             && (!parsed.content || parsed.content.length < 20)
             && isLlmLengthFinish(parsed.payload)
           ) {
-            const retryLimit = Math.min(
+            const firstRetryLimit = Math.min(
               2400,
               Math.max(
                 completionLimit > 0 ? completionLimit * 2 : 800,
@@ -353,9 +376,28 @@ export async function summarizeArticle(
             );
             const enlargedPayload = {
               ...buildBasePayload(false),
-              ...buildTokenLimit(provider, model, retryLimit),
+              ...buildTokenLimit(provider, model, firstRetryLimit),
             };
             parsed = await callWithPayload(enlargedPayload, 'summarize-article-retry');
+          }
+
+          if (
+            usesMaxCompletionTokens(provider, model)
+            && (!parsed.content || parsed.content.length < 20)
+            && isLlmLengthFinish(parsed.payload)
+          ) {
+            const secondRetryLimit = Math.min(
+              3600,
+              Math.max(
+                completionLimit > 0 ? completionLimit * 5 : 1800,
+                1800,
+              ),
+            );
+            const secondEnlargedPayload = {
+              ...buildBasePayload(false),
+              ...buildTokenLimit(provider, model, secondRetryLimit),
+            };
+            parsed = await callWithPayload(secondEnlargedPayload, 'summarize-article-retry');
           }
 
           const rawContent = parsed.content;

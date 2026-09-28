@@ -6,9 +6,15 @@ import { validateApiKey } from './_api-key.js';
 import { checkRateLimit } from './_rate-limit.js';
 import { cachedFetchJson, cachedFetchJsonWithMeta, getCachedJson } from '../server/_shared/redis';
 import { CHROME_UA } from '../server/_shared/constants';
-import { logLocalLlmFailure, logLocalLlmRequest } from '../server/_shared/local-llm-log';
+import {
+  logLlmRawFetchError,
+  logLlmRawRequest,
+  logLlmRawResponse,
+  logLocalLlmFailure,
+  logLocalLlmRequest,
+} from '../server/_shared/local-llm-log';
 import { runWithLocalLlmQueue } from '../server/_shared/local-llm-queue';
-import { extractFinalAnswerFromReasoning, extractLlmResponseText } from '../server/_shared/llm-content';
+import { extractFinalAnswerFromReasoning, extractLlmResponseText, isLlmLengthFinish } from '../server/_shared/llm-content';
 import { buildApiBaseOrigins } from './_internal-api-origin';
 
 export const config = { runtime: 'edge' };
@@ -105,9 +111,9 @@ const VISITOR_WINDOW_SECONDS = readPositiveInt('RECENT_QA_VISITOR_WINDOW_SECONDS
 
 function getProviderTimeoutMs(provider: ProviderConfig['id'], contextChars = 0): number {
   if (provider === 'ollama') {
-    const base = readPositiveInt('OLLAMA_TIMEOUT_MS', 120_000);
-    const dynamicExtra = Math.min(90_000, Math.max(0, Math.floor(contextChars * 8)));
-    return Math.min(readPositiveInt('RECENT_QA_OLLAMA_TIMEOUT_MAX_MS', 300_000), base + dynamicExtra);
+    const base = readPositiveInt('OLLAMA_TIMEOUT_MS', 45_000);
+    const dynamicExtra = Math.min(30_000, Math.max(0, Math.floor(contextChars * 3)));
+    return Math.min(readPositiveInt('RECENT_QA_OLLAMA_TIMEOUT_MAX_MS', 90_000), base + dynamicExtra);
   }
   return readPositiveInt('LLM_UPSTREAM_TIMEOUT_MS', 30_000);
 }
@@ -125,6 +131,22 @@ function getCompletionLimit(provider: ProviderConfig['id'], model: string): numb
 
 function getRecentQaDigestFetchTimeoutMs(): number {
   return readPositiveInt('RECENT_QA_DIGEST_FETCH_TIMEOUT_MS', 35_000);
+}
+
+function getRecentQaOllamaProviderAttempts(): number {
+  return readPositiveInt(
+    'RECENT_QA_OLLAMA_PROVIDER_ATTEMPTS',
+    readPositiveInt('OLLAMA_PROVIDER_ATTEMPTS', 2),
+  );
+}
+
+function getRecentQaOllamaRetryDelayMs(): number {
+  return readPositiveInt('RECENT_QA_OLLAMA_PROVIDER_RETRY_DELAY_MS', 1200);
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function usesMaxCompletionTokens(provider: ProviderConfig['id'], model: string): boolean {
@@ -181,14 +203,9 @@ function toLanguageCacheKey(lang: string): string {
   return (lang || 'en').toLowerCase().replace(/[^a-z0-9-]+/g, '_');
 }
 
-function getOllamaNoThinkPrefix(): string {
-  return '/set nothink\n';
-}
-
 function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
   return [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: getOllamaNoThinkPrefix().trim() },
     { role: 'user', content: userPrompt },
   ];
 }
@@ -474,10 +491,12 @@ async function askWithProviders(
   let lastError = 'Unknown AI error';
 
   for (const provider of providers) {
-    try {
-      const invokeProvider = async (): Promise<{ answer: string; provider: string; model: string }> => {
+    const invokeProvider = async (): Promise<{ answer: string; provider: string; model: string }> => {
         const completionLimit = getCompletionLimit(provider.id, provider.model);
-        const buildBody = () => {
+        const buildBody = (completionLimitOverride?: number) => {
+          const effectiveCompletionLimit = (
+            typeof completionLimitOverride === 'number' && Number.isFinite(completionLimitOverride)
+          ) ? Math.max(0, Math.floor(completionLimitOverride)) : completionLimit;
           return {
             model: provider.model,
             messages: provider.id === 'ollama'
@@ -487,10 +506,10 @@ async function askWithProviders(
                 { role: 'user', content: prompts.user },
               ],
             ...(usesDefaultSamplingOnly(provider.id, provider.model) ? {} : { temperature: 0.2, top_p: 0.9 }),
-            ...(completionLimit > 0
+            ...(effectiveCompletionLimit > 0
               ? (usesMaxCompletionTokens(provider.id, provider.model)
-                ? { max_completion_tokens: completionLimit }
-                : { max_tokens: completionLimit })
+                ? { max_completion_tokens: effectiveCompletionLimit }
+                : { max_tokens: effectiveCompletionLimit })
               : {}),
             ...(provider.extraBody || {}),
           };
@@ -501,19 +520,32 @@ async function askWithProviders(
           scope: 'recent-events-qa' | 'recent-events-qa-retry',
         ): Promise<Record<string, unknown>> => {
           logLocalLlmRequest(scope, provider.id, provider.apiUrl, provider.model);
-          const resp = await fetch(provider.apiUrl, {
-            method: 'POST',
-            headers: { ...provider.headers, 'User-Agent': CHROME_UA },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(getProviderTimeoutMs(provider.id, context.contextChars)),
-          });
+          logLlmRawRequest(scope, provider.id, provider.apiUrl, provider.model, body);
+          let resp: Response;
+          try {
+            resp = await fetch(provider.apiUrl, {
+              method: 'POST',
+              headers: { ...provider.headers, 'User-Agent': CHROME_UA },
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(getProviderTimeoutMs(provider.id, context.contextChars)),
+            });
+          } catch (error) {
+            logLlmRawFetchError(scope, provider.id, provider.apiUrl, provider.model, error);
+            throw error;
+          }
+          const rawBody = await resp.text();
+          logLlmRawResponse(scope, provider.id, provider.apiUrl, provider.model, resp.status, rawBody);
 
           if (!resp.ok) {
-            const errorText = (await resp.text()).replace(/\s+/g, ' ').trim().slice(0, 240);
+            const errorText = rawBody.replace(/\s+/g, ' ').trim().slice(0, 240);
             throw new Error(`${provider.id} HTTP ${resp.status}${errorText ? `: ${errorText}` : ''}`);
           }
 
-          return await resp.json() as Record<string, unknown>;
+          try {
+            return JSON.parse(rawBody) as Record<string, unknown>;
+          } catch {
+            throw new Error(`${provider.id} invalid JSON response`);
+          }
         };
 
         let data = await call(buildBody(), 'recent-events-qa');
@@ -523,6 +555,21 @@ async function askWithProviders(
         }
         if (!answer && provider.id === 'ollama') {
           data = await call(buildBody(), 'recent-events-qa-retry');
+          answer = extractLlmResponseText(data).trim();
+          if (!answer) {
+            answer = extractFinalAnswerFromReasoning(data).trim();
+          }
+        }
+        if (
+          (!answer || answer.length < 20)
+          && usesMaxCompletionTokens(provider.id, provider.model)
+          && isLlmLengthFinish(data)
+        ) {
+          const enlargedLimit = Math.min(
+            2400,
+            Math.max(completionLimit + 500, Math.floor(completionLimit * 3)),
+          );
+          data = await call(buildBody(enlargedLimit), 'recent-events-qa-retry');
           answer = extractLlmResponseText(data).trim();
           if (!answer) {
             answer = extractFinalAnswerFromReasoning(data).trim();
@@ -548,17 +595,26 @@ async function askWithProviders(
         }
         return { answer, provider: provider.id, model: provider.model };
       };
-
-      if (provider.id === 'ollama') {
-        return await runWithLocalLlmQueue('recent-events-qa', invokeProvider);
+    const providerAttempts = provider.id === 'ollama' ? getRecentQaOllamaProviderAttempts() : 1;
+    for (let attempt = 1; attempt <= providerAttempts; attempt += 1) {
+      try {
+        if (provider.id === 'ollama') {
+          return await runWithLocalLlmQueue('recent-events-qa', invokeProvider);
+        }
+        return await invokeProvider();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logLocalLlmFailure('recent-events-qa', provider.id, provider.model, 'request_error', undefined, {
+          error: message.slice(0, 180),
+          attempt,
+          maxAttempts: providerAttempts,
+        });
+        lastError = message;
+        if (provider.id !== 'ollama' || attempt >= providerAttempts) {
+          break;
+        }
+        await sleepMs(getRecentQaOllamaRetryDelayMs() * attempt);
       }
-      return await invokeProvider();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logLocalLlmFailure('recent-events-qa', provider.id, provider.model, 'request_error', undefined, {
-        error: message.slice(0, 180),
-      });
-      lastError = message;
     }
   }
 

@@ -9,7 +9,13 @@ import type {
 import { cachedFetchJson } from '../../../_shared/redis';
 import { hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
-import { isLikelyLocalLlmUrl, logLocalLlmRequest } from '../../../_shared/local-llm-log';
+import {
+    isLikelyLocalLlmUrl,
+    logLlmRawFetchError,
+    logLlmRawRequest,
+    logLlmRawResponse,
+    logLocalLlmRequest,
+} from '../../../_shared/local-llm-log';
 import { runWithLocalLlmQueue } from '../../../_shared/local-llm-queue';
 import { extractLlmResponseText } from '../../../_shared/llm-content';
 
@@ -36,14 +42,9 @@ function usesOpenAiCompletionTokens(apiUrl: string, model: string): boolean {
     );
 }
 
-function getOllamaNoThinkPrefix(): string {
-    return '/set nothink\n';
-}
-
 function buildOllamaChatMessages(systemPrompt: string, userPrompt: string): Array<{ role: 'system' | 'user'; content: string }> {
     return [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: getOllamaNoThinkPrefix().trim() },
         { role: 'user', content: userPrompt },
     ];
 }
@@ -108,20 +109,34 @@ Your task is to DEDUCT the situation in a near timeline (e.g. 24 hours to a few 
 
                 const invokeProvider = async (): Promise<{ analysis: string; model: string; provider: string } | null> => {
                     logLocalLlmRequest('deduct-situation', 'llm', apiUrl, model);
-                    const resp = await fetch(apiUrl, {
-                        method: 'POST',
-                        headers: {
-                            Authorization: `Bearer ${apiKey}`,
-                            'Content-Type': 'application/json',
-                            'User-Agent': CHROME_UA
-                        },
-                        body: JSON.stringify(payload),
-                        signal: AbortSignal.timeout(parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? DEDUCT_TIMEOUT_MS),
-                    });
+                    logLlmRawRequest('deduct-situation', 'llm', apiUrl, model, payload);
+                    let resp;
+                    try {
+                        resp = await fetch(apiUrl, {
+                            method: 'POST',
+                            headers: {
+                                Authorization: `Bearer ${apiKey}`,
+                                'Content-Type': 'application/json',
+                                'User-Agent': CHROME_UA
+                            },
+                            body: JSON.stringify(payload),
+                            signal: AbortSignal.timeout(parsePositiveInt(process.env.LLM_UPSTREAM_TIMEOUT_MS) ?? DEDUCT_TIMEOUT_MS),
+                        });
+                    } catch (error) {
+                        logLlmRawFetchError('deduct-situation', 'llm', apiUrl, model, error);
+                        throw error;
+                    }
+                    const rawBody = await resp.text();
+                    logLlmRawResponse('deduct-situation', 'llm', apiUrl, model, resp.status, rawBody);
 
                     if (!resp.ok) return null;
 
-                    const data = await resp.json() as Record<string, unknown>;
+                    let data: Record<string, unknown>;
+                    try {
+                        data = JSON.parse(rawBody) as Record<string, unknown>;
+                    } catch {
+                        return null;
+                    }
                     let raw = extractLlmResponseText(data).trim();
                     if (!raw) return null;
 

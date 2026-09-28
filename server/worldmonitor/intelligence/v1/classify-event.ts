@@ -11,6 +11,7 @@ import { cachedFetchJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, GROQ_API_URL, GROQ_MODEL, hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
 import { extractLlmResponseText } from '../../../_shared/llm-content';
+import { logLlmRawRequest, logLlmRawResponse } from '../../../_shared/local-llm-log';
 
 // ========================================================================
 // Constants
@@ -68,23 +69,32 @@ Focus: geopolitical events, conflicts, disasters, diplomacy. Classify by real-wo
 
 Return: {"level":"...","category":"..."}`;
 
+          const payload = {
+            model: GROQ_MODEL,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: title },
+            ],
+            temperature: 0,
+            max_tokens: 50,
+          };
+          logLlmRawRequest('classify-event', 'groq', GROQ_API_URL, GROQ_MODEL, payload);
           const resp = await fetch(GROQ_API_URL, {
             method: 'POST',
             headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
-            body: JSON.stringify({
-              model: GROQ_MODEL,
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: title },
-              ],
-              temperature: 0,
-              max_tokens: 50,
-            }),
+            body: JSON.stringify(payload),
             signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
           });
+          const rawBody = await resp.text();
+          logLlmRawResponse('classify-event', 'groq', GROQ_API_URL, GROQ_MODEL, resp.status, rawBody);
 
           if (!resp.ok) return null;
-          const data = await resp.json() as Record<string, unknown>;
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(rawBody) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
           const raw = extractLlmResponseText(data).trim();
           if (!raw) return null;
 

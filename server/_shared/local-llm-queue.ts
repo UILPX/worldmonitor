@@ -1,19 +1,27 @@
 declare const process: { env: Record<string, string | undefined> };
 const LOCAL_LLM_QUEUE_VERBOSE_LOGS = process.env.LOCAL_LLM_QUEUE_VERBOSE_LOGS === 'true';
+const LOCAL_LLM_GLOBAL_LOCK_ENABLED = process.env.LOCAL_LLM_GLOBAL_LOCK_ENABLED !== 'false';
 
 interface QueueTask {
   scope: string;
   priority: number;
   seq: number;
   enqueuedAt: number;
+  startedAt: number | null;
   run: () => Promise<unknown>;
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
   timeoutId: ReturnType<typeof setTimeout> | null;
 }
 
+interface DistributedLockHandle {
+  key: string;
+  token: string;
+}
+
 let activeCount = 0;
 const pendingTasks: QueueTask[] = [];
+const activeTasks: QueueTask[] = [];
 let nextSeq = 0;
 
 function parsePositiveInt(raw: string | undefined): number | null {
@@ -23,15 +31,131 @@ function parsePositiveInt(raw: string | undefined): number | null {
   return Math.floor(value);
 }
 
+function parseNonNegativeInt(raw: string | undefined): number | null {
+  if (raw == null || raw === '') return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.floor(value);
+}
+
 function getQueueSettings(): { maxConcurrency: number; maxPending: number; waitTimeoutMs: number } {
   const maxConcurrency = parsePositiveInt(process.env.LOCAL_LLM_MAX_CONCURRENCY) ?? 1;
   const maxPending = parsePositiveInt(process.env.LOCAL_LLM_QUEUE_MAX_PENDING) ?? 16;
-  const waitTimeoutMs = parsePositiveInt(process.env.LOCAL_LLM_QUEUE_WAIT_MS) ?? 120_000;
   return {
     maxConcurrency: Math.max(1, maxConcurrency),
     maxPending: Math.max(1, maxPending),
-    waitTimeoutMs: Math.max(1000, waitTimeoutMs),
+    // Queue waiting must not count as timeout; only LLM upstream call timeout applies.
+    waitTimeoutMs: 0,
   };
+}
+
+function getRedisPrefix(): string {
+  const env = process.env.VERCEL_ENV;
+  if (!env || env === 'production') return '';
+  const sha = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 8) || 'dev';
+  return `${env}:${sha}:`;
+}
+
+function getDistributedLockKey(): string {
+  return `${getRedisPrefix()}${process.env.LOCAL_LLM_GLOBAL_LOCK_KEY || 'local-llm:global-lock'}`;
+}
+
+function getDistributedLockTtlMs(): number {
+  return parsePositiveInt(process.env.LOCAL_LLM_GLOBAL_LOCK_TTL_MS) ?? 180_000;
+}
+
+function getDistributedLockWaitMs(): number {
+  return parseNonNegativeInt(process.env.LOCAL_LLM_GLOBAL_LOCK_WAIT_MS) ?? 0;
+}
+
+function getDistributedLockPollMs(): number {
+  return parsePositiveInt(process.env.LOCAL_LLM_GLOBAL_LOCK_POLL_MS) ?? 300;
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function tryAcquireDistributedLock(
+  lockKey: string,
+  token: string,
+  ttlMs: number,
+): Promise<boolean> {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const auth = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !auth || !LOCAL_LLM_GLOBAL_LOCK_ENABLED) return true;
+
+  try {
+    const resp = await fetch(
+      `${url}/set/${encodeURIComponent(lockKey)}/${encodeURIComponent(token)}/PX/${ttlMs}/NX`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${auth}` },
+        signal: AbortSignal.timeout(3_000),
+      },
+    );
+    if (!resp.ok) return true;
+    const payload = (await resp.json()) as { result?: string | null };
+    return payload.result === 'OK';
+  } catch {
+    return true;
+  }
+}
+
+async function acquireDistributedLock(scope: string): Promise<DistributedLockHandle | null> {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const auth = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !auth || !LOCAL_LLM_GLOBAL_LOCK_ENABLED) return null;
+
+  const key = getDistributedLockKey();
+  const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const ttlMs = getDistributedLockTtlMs();
+  const waitMs = getDistributedLockWaitMs();
+  const pollMs = getDistributedLockPollMs();
+  const started = Date.now();
+
+  while (waitMs <= 0 || (Date.now() - started) < waitMs) {
+    const ok = await tryAcquireDistributedLock(key, token, ttlMs);
+    if (ok) {
+      if (LOCAL_LLM_QUEUE_VERBOSE_LOGS) {
+        const waited = Date.now() - started;
+        if (waited >= 500) {
+          console.log(`[LocalLLM][Queue] ${scope} acquired global lock after ${waited}ms`);
+        }
+      }
+      return { key, token };
+    }
+    await sleepMs(pollMs);
+  }
+
+  throw new Error(`Local LLM global lock wait timeout (${waitMs}ms)`);
+}
+
+async function releaseDistributedLock(handle: DistributedLockHandle | null): Promise<void> {
+  if (!handle) return;
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const auth = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !auth || !LOCAL_LLM_GLOBAL_LOCK_ENABLED) return;
+
+  try {
+    const getResp = await fetch(`${url}/get/${encodeURIComponent(handle.key)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${auth}` },
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!getResp.ok) return;
+    const getPayload = (await getResp.json()) as { result?: string | null };
+    if (getPayload.result !== handle.token) return;
+
+    await fetch(`${url}/del/${encodeURIComponent(handle.key)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth}` },
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    // best-effort unlock
+  }
 }
 
 function parseScopePriorityMap(raw: string | undefined): Record<string, number> {
@@ -71,6 +195,8 @@ function removePendingTask(task: QueueTask): void {
 
 function runTask(task: QueueTask): void {
   activeCount += 1;
+  task.startedAt = Date.now();
+  activeTasks.push(task);
   if (task.timeoutId) {
     clearTimeout(task.timeoutId);
     task.timeoutId = null;
@@ -81,10 +207,19 @@ function runTask(task: QueueTask): void {
     console.log(`[LocalLLM][Queue] ${task.scope} waited ${waitMs}ms (active=${activeCount}, pending=${pendingTasks.length})`);
   }
 
-  task.run()
+  (async () => {
+    const lockHandle = await acquireDistributedLock(task.scope);
+    try {
+      return await task.run();
+    } finally {
+      await releaseDistributedLock(lockHandle);
+    }
+  })()
     .then(task.resolve, task.reject)
     .finally(() => {
       activeCount = Math.max(0, activeCount - 1);
+      const idx = activeTasks.indexOf(task);
+      if (idx >= 0) activeTasks.splice(idx, 1);
       drainQueue();
     });
 }
@@ -107,6 +242,7 @@ export function runWithLocalLlmQueue<T>(scope: string, run: () => Promise<T>): P
       priority: resolveScopePriority(scope),
       seq: nextSeq++,
       enqueuedAt: Date.now(),
+      startedAt: null,
       run: () => run() as Promise<unknown>,
       resolve: value => resolve(value as T),
       reject,
@@ -123,10 +259,12 @@ export function runWithLocalLlmQueue<T>(scope: string, run: () => Promise<T>): P
       return;
     }
 
-    task.timeoutId = setTimeout(() => {
-      removePendingTask(task);
-      reject(new Error(`Local LLM queue wait timeout (${waitTimeoutMs}ms)`));
-    }, waitTimeoutMs);
+    if (waitTimeoutMs > 0) {
+      task.timeoutId = setTimeout(() => {
+        removePendingTask(task);
+        reject(new Error(`Local LLM queue wait timeout (${waitTimeoutMs}ms)`));
+      }, waitTimeoutMs);
+    }
 
     const insertAt = pendingTasks.findIndex((existing) => {
       if (task.priority !== existing.priority) return task.priority > existing.priority;
@@ -140,4 +278,39 @@ export function runWithLocalLlmQueue<T>(scope: string, run: () => Promise<T>): P
 
 export function getLocalLlmQueueStats(): { active: number; pending: number } {
   return { active: activeCount, pending: pendingTasks.length };
+}
+
+interface QueueTaskView {
+  scope: string;
+  priority: number;
+  seq: number;
+  enqueuedAt: number;
+  startedAt: number | null;
+  waitMs: number;
+  runMs: number;
+}
+
+export function getLocalLlmQueueSnapshot(): {
+  active: QueueTaskView[];
+  pending: QueueTaskView[];
+  stats: { active: number; pending: number };
+  updatedAt: number;
+} {
+  const now = Date.now();
+  const toView = (task: QueueTask): QueueTaskView => ({
+    scope: task.scope,
+    priority: task.priority,
+    seq: task.seq,
+    enqueuedAt: task.enqueuedAt,
+    startedAt: task.startedAt,
+    waitMs: Math.max(0, (task.startedAt ?? now) - task.enqueuedAt),
+    runMs: task.startedAt ? Math.max(0, now - task.startedAt) : 0,
+  });
+
+  return {
+    active: activeTasks.map(toView),
+    pending: pendingTasks.map(toView),
+    stats: { active: activeCount, pending: pendingTasks.length },
+    updatedAt: now,
+  };
 }

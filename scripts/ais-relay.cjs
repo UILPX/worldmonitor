@@ -514,7 +514,11 @@ const TELEGRAM_POLL_INTERVAL_MS = Math.max(15_000, Number(process.env.TELEGRAM_P
 const TELEGRAM_MAX_FEED_ITEMS = Math.max(50, Number(process.env.TELEGRAM_MAX_FEED_ITEMS || 200));
 const TELEGRAM_MAX_TEXT_CHARS = Math.max(200, Number(process.env.TELEGRAM_MAX_TEXT_CHARS || 800));
 const TELEGRAM_CONNECTION_RETRIES = Math.max(1, Number(process.env.TELEGRAM_CONNECTION_RETRIES || 5));
-const TELEGRAM_RECEIVE_UPDATES = envEnabled('TELEGRAM_RECEIVE_UPDATES', false);
+// Polling mode only. GramJS update loop is noisy and unnecessary for this relay.
+const TELEGRAM_RECEIVE_UPDATES = false;
+if (envEnabled('TELEGRAM_RECEIVE_UPDATES', false)) {
+  console.warn('[Relay] TELEGRAM_RECEIVE_UPDATES=true ignored; relay forces polling-only mode');
+}
 const TELEGRAM_TRANSIENT_LOG_THROTTLE_MS = Math.max(5_000, Number(process.env.TELEGRAM_TRANSIENT_LOG_THROTTLE_MS || 30_000));
 
 const telegramState = {

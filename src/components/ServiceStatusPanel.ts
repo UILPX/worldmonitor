@@ -20,6 +20,24 @@ interface LocalBackendStatus {
   remoteBase?: string;
 }
 
+interface LocalLlmQueueTask {
+  scope: string;
+  priority: number;
+  seq: number;
+  enqueuedAt: number;
+  startedAt: number | null;
+  waitMs: number;
+  runMs: number;
+}
+
+interface LocalLlmQueueState {
+  ok: boolean;
+  stats: { active: number; pending: number };
+  active: LocalLlmQueueTask[];
+  pending: LocalLlmQueueTask[];
+  updatedAt: number;
+}
+
 type CategoryFilter = 'all' | 'cloud' | 'dev' | 'comm' | 'ai' | 'saas';
 
 function getCategoryLabel(category: CategoryFilter): string {
@@ -40,10 +58,16 @@ export class ServiceStatusPanel extends Panel {
   private error: string | null = null;
   private filter: CategoryFilter = 'all';
   private localBackend: LocalBackendStatus | null = null;
+  private localLlmQueue: LocalLlmQueueState | null = null;
+  private localLlmQueueError: string | null = null;
+  private localLlmQueuePollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastQueueFingerprint = '';
 
   constructor() {
     super({ id: 'service-status', title: t('panels.serviceStatus'), showCount: false });
     void this.fetchStatus();
+    void this.fetchLocalLlmQueueStatus();
+    this.startLocalLlmQueuePolling();
   }
 
   private lastServicesJson = '';
@@ -109,6 +133,7 @@ export class ServiceStatusPanel extends Panel {
 
     replaceChildren(this.content,
       this.buildBackendStatus(),
+      this.buildLocalLlmQueueStatus(),
       this.buildDesktopReadiness(),
       this.buildSummary(filtered),
       this.buildFilters(),
@@ -186,6 +211,97 @@ export class ServiceStatusPanel extends Panel {
     );
   }
 
+  private startLocalLlmQueuePolling(): void {
+    if (this.localLlmQueuePollTimer) return;
+    this.localLlmQueuePollTimer = setInterval(() => {
+      void this.fetchLocalLlmQueueStatus();
+    }, 3000);
+  }
+
+  private async fetchLocalLlmQueueStatus(): Promise<void> {
+    try {
+      const resp = await fetch('/api/local-llm-queue', {
+        cache: 'no-store',
+        signal: this.signal,
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const payload = (await resp.json()) as LocalLlmQueueState;
+      const fingerprint = JSON.stringify({
+        a: payload.stats.active,
+        p: payload.stats.pending,
+        active: payload.active.map((task) => `${task.seq}:${task.scope}:${task.runMs}`).join('|'),
+        pending: payload.pending.map((task) => `${task.seq}:${task.scope}:${task.waitMs}`).join('|'),
+      });
+
+      const changed = fingerprint !== this.lastQueueFingerprint || this.localLlmQueueError !== null;
+      this.lastQueueFingerprint = fingerprint;
+      this.localLlmQueue = payload;
+      this.localLlmQueueError = null;
+      if (changed) this.render();
+    } catch (error) {
+      if (this.isAbortError(error)) return;
+      const message = error instanceof Error ? error.message : 'Queue status fetch failed';
+      if (this.localLlmQueueError !== message) {
+        this.localLlmQueueError = message;
+        this.render();
+      }
+    }
+  }
+
+  private formatDuration(ms: number): string {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  private buildTaskRows(tasks: LocalLlmQueueTask[], active: boolean): DomChild[] {
+    return tasks.map((task) =>
+      h('li', { className: 'service-status-llm-queue-item' },
+        h('span', { className: 'scope' }, task.scope),
+        h('span', { className: 'meta' },
+          active
+            ? `wait ${this.formatDuration(task.waitMs)} · run ${this.formatDuration(task.runMs)}`
+            : `queued ${this.formatDuration(Date.now() - task.enqueuedAt)} · wait ${this.formatDuration(task.waitMs)}`,
+        ),
+      ),
+    );
+  }
+
+  private buildLocalLlmQueueStatus(): DomChild {
+    const queue = this.localLlmQueue;
+    const activeTasks = queue?.active ?? [];
+    const pendingTasks = queue?.pending ?? [];
+    const activeCount = queue?.stats.active ?? activeTasks.length;
+    const pendingCount = queue?.stats.pending ?? pendingTasks.length;
+    const summaryText = `Local LLM Queue (${pendingCount} queued, ${activeCount} running)`;
+
+    return h('details', { className: 'service-status-llm-queue' },
+      h('summary', null, summaryText),
+      h('div', { className: 'service-status-llm-queue-meta' },
+        queue?.updatedAt
+          ? `Updated ${new Date(queue.updatedAt).toLocaleTimeString()}`
+          : 'Waiting for queue status...',
+      ),
+      this.localLlmQueueError
+        ? h('div', { className: 'service-status-llm-queue-error' }, this.localLlmQueueError)
+        : false,
+      h('div', { className: 'service-status-llm-queue-group' },
+        h('div', { className: 'service-status-llm-queue-title' }, 'Running'),
+        activeTasks.length > 0
+          ? h('ul', { className: 'service-status-llm-queue-list' }, ...this.buildTaskRows(activeTasks, true))
+          : h('div', { className: 'service-status-llm-queue-empty' }, 'No running tasks'),
+      ),
+      h('div', { className: 'service-status-llm-queue-group' },
+        h('div', { className: 'service-status-llm-queue-title' }, 'Queued'),
+        pendingTasks.length > 0
+          ? h('ul', { className: 'service-status-llm-queue-list' }, ...this.buildTaskRows(pendingTasks, false))
+          : h('div', { className: 'service-status-llm-queue-empty' }, 'No queued tasks'),
+      ),
+    );
+  }
+
   private buildFilters(): HTMLElement {
     const categories: CategoryFilter[] = ['all', 'cloud', 'dev', 'comm', 'ai', 'saas'];
     return h('div', { className: 'service-status-filters' },
@@ -216,6 +332,14 @@ export class ServiceStatusPanel extends Panel {
       case 'outage': return '○';
       default: return '?';
     }
+  }
+
+  public override destroy(): void {
+    if (this.localLlmQueuePollTimer) {
+      clearInterval(this.localLlmQueuePollTimer);
+      this.localLlmQueuePollTimer = null;
+    }
+    super.destroy();
   }
 
 }

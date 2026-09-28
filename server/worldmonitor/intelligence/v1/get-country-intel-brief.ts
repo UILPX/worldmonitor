@@ -10,6 +10,7 @@ import { cachedFetchJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, GROQ_API_URL, GROQ_MODEL, TIER1_COUNTRIES, hashString } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
 import { extractLlmResponseText } from '../../../_shared/llm-content';
+import { logLlmRawRequest, logLlmRawResponse } from '../../../_shared/local-llm-log';
 
 // ========================================================================
 // Constants
@@ -78,23 +79,32 @@ Rules:
           userPromptParts.push(`Context snapshot:\n${contextSnapshot}`);
         }
 
+        const payload = {
+          model: GROQ_MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPromptParts.join('\n\n') },
+          ],
+          temperature: 0.4,
+          max_tokens: 900,
+        };
+        logLlmRawRequest('get-country-intel-brief', 'groq', GROQ_API_URL, GROQ_MODEL, payload);
         const resp = await fetch(GROQ_API_URL, {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
-          body: JSON.stringify({
-            model: GROQ_MODEL,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPromptParts.join('\n\n') },
-            ],
-            temperature: 0.4,
-            max_tokens: 900,
-          }),
+          body: JSON.stringify(payload),
           signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
         });
+        const rawBody = await resp.text();
+        logLlmRawResponse('get-country-intel-brief', 'groq', GROQ_API_URL, GROQ_MODEL, resp.status, rawBody);
 
         if (!resp.ok) return null;
-        const data = await resp.json() as Record<string, unknown>;
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(rawBody) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
         const brief = extractLlmResponseText(data).trim();
         if (!brief) return null;
 

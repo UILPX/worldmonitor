@@ -3,6 +3,7 @@ node_modules/
 dist/
 .DS_Store
 *.log
+worldmonitor-*-amd64.tar
 .env
 .env.local
 .playwright-mcp/

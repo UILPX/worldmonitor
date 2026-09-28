@@ -12378,6 +12378,73 @@ a.prediction-link:hover {
   color: var(--text-dim);
 }
 
+.service-status-llm-queue {
+  margin-bottom: 8px;
+  background: var(--darken-medium);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+
+.service-status-llm-queue > summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.service-status-llm-queue-meta {
+  margin-top: 6px;
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.service-status-llm-queue-error {
+  margin-top: 6px;
+  font-size: 9px;
+  color: var(--red);
+}
+
+.service-status-llm-queue-group {
+  margin-top: 8px;
+}
+
+.service-status-llm-queue-title {
+  font-size: 9px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 4px;
+}
+
+.service-status-llm-queue-list {
+  margin: 0;
+  padding-left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.service-status-llm-queue-item {
+  font-size: 10px;
+  color: var(--text);
+}
+
+.service-status-llm-queue-item .scope {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.service-status-llm-queue-item .meta {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.service-status-llm-queue-empty {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 .all-operational {
   text-align: center;
   padding: 12px;
